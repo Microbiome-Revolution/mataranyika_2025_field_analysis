@@ -1,0 +1,1600 @@
+#Install all required packages
+required_packages <- c(
+  "phyloseq", "ggplot2", "vegan", "dplyr", "tidyr",
+  "SimpleMetaPackage", "metagMisc", "purrr", "scales",
+  "igraph", "hillR", "tibble"
+)
+
+install.packages(setdiff(required_packages, rownames(installed.packages())))
+install.packages("BiocManager")
+library("BiocManager")
+
+BiocManager::install("phyloseq")
+
+install.packages("devtools")
+devtools::install_github("J-Cos/SimpleMetaPackage")
+remotes::install_github("vmikk/metagMisc")
+install.packages("remotes")
+
+# Load Required Libraries
+library(devtools)
+library(phyloseq)
+library(ggplot2)
+library(vegan)      # For ordination and PERMANOVA
+library(dplyr)      # For data manipulation
+library(tidyr)      # For reshaping data
+library(SimpleMetaPackage)  # For converting pipeline output to Phyloseq object
+library(metagMisc)
+library(purrr)
+library(scales)       # For percent_format
+library(igraph)
+library(hillR)
+library(tibble)  # For rownames_to_column()
+
+
+#convert SMP output to phyloseq object
+ps<-SeqDataTable2Phyloseq(SeqDataTablePath= "R1SeqDataTable.RDS" )
+find("SeqDataTable2Phyloseq")
+
+
+ls("package:SimpleMetaPackage")
+SimpleMetaPackage::SeqDataTable2Phyloseq("R1SeqDataTable.RDS")
+
+# Then load the package
+library(SMP)
+
+seqdata <- readRDS("R1SeqDataTable.RDS")
+str(seqdata)
+
+# Load the metadata CSV
+metadata <- read.csv("R1_field_data1.csv", stringsAsFactors = FALSE)
+
+metadata <- metadata %>% filter(SampleID != "")
+
+#Ensure row names match sample IDs
+rownames(metadata) <- metadata$SampleID  
+
+#Remove redundant SampleID column
+metadata$SampleID <- NULL                
+
+#Replace the current sam_data with the new metadata:
+sample_data(ps) <- sample_data(metadata)
+
+# Subset Data for Analysis
+# Ensure `ps` is the full phyloseq object
+# pick which subset to work on, add column in metadata to match project name for each sample
+ps_project <- subset_samples(ps, project %in% c("sample", "farmer_kit"))
+
+# if you want to only use samples excluding farmer kits
+ps_project <- subset_samples(ps, project == "sample")
+
+#Transpose OTU Table
+otu_table(ps_project) <- t(otu_table(ps_project))
+
+# Prune samples associated with these bad OTUs
+ps_clean <- ps_project %>%
+  subset_taxa(order != "unclassified_Cyanobacteriia") %>% 
+  subset_taxa(class != "unclassified_Cyanobacteria") %>%  
+  subset_taxa(phylum != "unclassified_Bacteria") %>%
+  subset_taxa(domain != "unclassified_Root") %>% 
+  subset_taxa(domain != "Eukaryota") %>%
+  subset_taxa(order != "Chloroplast") %>%
+  subset_taxa(family != "Mitochondria")
+
+
+# Verify the filtering
+cat("Number of OTUs before filtering:", ntaxa(ps_project), "\n")
+cat("Number of OTUs after filtering:", ntaxa(ps_clean), "\n")
+
+# Convert phyloseq otu_table to a standard R matrix
+otu_matrix <- as(otu_table(ps_clean), "matrix")  # Use explicit coercion
+
+# Remove empty samples and OTUs
+otu_matrix <- otu_matrix[rowSums(otu_matrix) > 0, colSums(otu_matrix) > 0]
+
+
+#should print "numeric" or "integer" 
+cat("Data type:", class(otu_matrix[1, 1]), "\n")
+
+#IF DATA is numeric, force to integers
+#otu_matrix <- round(otu_matrix)  # Only if appropriate for your data!
+
+# Verify data type and values
+#should be "numeric" or "integer"
+cat("Data type:", class(otu_matrix[1, 1]), "\n")
+cat("Non-integer values present:", any(otu_matrix != floor(otu_matrix)), "\n")
+
+# After creating otu_matrix:
+
+# Should show [samples] x [OTUs], e.g., 20 100
+print(dim(otu_matrix))  
+
+# Confirm taxonomic ranks
+print(colnames(tax_table(ps_clean)))  
+
+# Must be >0
+cat("OTUs remaining:", ncol(otu_matrix), "\n")  
+
+# Must be >0
+cat("Samples remaining:", nrow(otu_matrix), "\n") 
+
+# Auto-adjust step size to 10% of the smallest sample's reads
+min_reads <- min(rowSums(otu_matrix))
+step_size <- max(1, floor(min_reads / 10))
+
+# Check 3: Ensure matrix orientation (samples = rows, OTUs = columns)
+cat("Matrix dimensions (samples x OTUs):", dim(otu_matrix), "\n")
+
+# Check 4: Remove empty OTUs (columns) and samples (rows)
+
+# Remove OTUs with 0 total reads
+otu_matrix <- otu_matrix[, colSums(otu_matrix) > 0]  
+
+# Remove samples with 0 reads
+otu_matrix <- otu_matrix[rowSums(otu_matrix) > 0, ]  
+
+# Final validation
+stopifnot(
+  nrow(otu_matrix) > 0,    # At least 1 sample
+  ncol(otu_matrix) > 0,    # At least 1 OTU
+  all(otu_matrix >= 0)     # No negative counts
+)
+
+# Generate rarefaction curves with safety checks
+tryCatch({
+  RCurve <- rarecurve(
+    otu_matrix,
+    step = 500,
+    tidy = FALSE,
+    label = FALSE
+  )
+  
+}, error = function(e) {
+  message("Rarecurve failed with error: ", e$message)
+  stop("Verify OTU table contains integer counts and proper orientation")
+})
+
+# Convert to tidy format with proper sample names
+RCurve_tidy <- imap_dfr(RCurve, ~ {
+  data.frame(
+    Sample = rownames(otu_matrix)[.y],  # Use original sample names
+    Reads = attr(.x, "Subsample"),
+    OTUs = as.vector(.x),
+    stringsAsFactors = FALSE
+  )
+})
+
+ggplot(RCurve_tidy, aes(x = Reads, y = OTUs)) +
+  geom_line(aes(group = Sample), alpha = 0.3, linewidth = 0.5) +
+  geom_vline(xintercept = 1250, linetype = "dashed", color = "red") +
+  labs(
+    x = "Sequencing Depth",
+    y = "Observed OTUs",
+    title = "Rarefaction Curves",
+    subtitle = paste(
+      "Samples:", nrow(otu_matrix), 
+      "| OTUs:", ncol(otu_matrix))
+  ) +
+  theme_minimal() +
+  scale_x_continuous(labels = scales::comma) +
+  scale_y_continuous(labels = scales::comma)
+
+
+# Extract read counts per sample
+seq_depths <- sample_sums(ps_clean)  # Get total reads per sample
+
+# Convert to a data frame for ggplot2
+depth_df <- data.frame(Sample = names(seq_depths), Reads = seq_depths)
+
+#plot histogram of sequencing depths
+ggplot(depth_df, aes(x = Reads)) +
+  geom_histogram(binwidth = 100, fill = "blue", alpha = 0.5, color = "black") +
+  geom_vline(xintercept = 750, linetype = "dashed", color = "red") +  # Current threshold
+  geom_vline(xintercept = 1000, linetype = "dashed", color = "orange") +  # Alternative
+  geom_vline(xintercept = 1250, linetype = "dashed", color = "green") +  # Alternative
+  labs(title = "Distribution of Sequencing Depths",
+       x = "Sequencing Depth (Total Reads per Sample)",
+       y = "Number of Samples") +
+  theme_minimal()
+
+# Keep only samples that ALWAYS meet rarefaction threshold
+ps_filtered <- prune_samples(
+  sample_sums(ps_clean) >= 1250,  # Samples with ≥1250 reads
+  ps_clean
+)
+
+# Verify retained samples
+cat("Samples retained:", nsamples(ps_filtered))
+
+# Rarefy the dataset to 1250 reads for 50 times to reduce randomness(adjust as needed)
+ps_rarefied <- phyloseq_mult_raref(ps_filtered, SampSize = 1250, iter = 50)
+
+# Define reference sample order
+reference_order <- rownames(sample_data(ps_filtered))
+
+# Alpha Diversity Analysis with MULTIPLE RAREFACTIONS
+# ---------------------------------------------------------
+# Calculate Shannon with alignment
+all_shannon <- lapply(ps_rarefied, function(phy) {
+  # Convert the OTU table to a matrix
+  otu <- as(otu_table(phy), "matrix")
+  
+  # Check orientation: if taxa are rows, then samples are in columns and need to be transposed.
+  if (phyloseq::taxa_are_rows(phy)) {
+    otu <- t(otu)
+  }
+  
+  # Now, assign sample names unconditionally.
+  # This assumes that after the conditional transposition, the rows of 'otu' represent samples.
+  rownames(otu) <- sample_names(phy)
+  
+  # Compute Shannon diversity
+  shan <- vegan::diversity(otu, index = "shannon")
+  
+  # Reorder using match; if a sample is missing, this will produce NA
+  shan_ordered <- shan[match(reference_order, names(shan))]
+  
+  return(shan_ordered)
+})
+
+# Verify order consistency
+for (i in seq_along(all_shannon)) {
+  if (!identical(names(all_shannon[[i]]), reference_order)) {
+    cat("Mismatch in iteration:", i, "\n")
+    print(names(all_shannon[[i]]))
+    print(reference_order)
+  }
+}
+
+# Assign averaged values
+metadata_filtered <- data.frame(sample_data(ps_filtered))[reference_order, ]
+metadata_filtered$Shannon <- rowMeans(do.call(cbind, all_shannon), na.rm = TRUE)
+
+# Update the metadata of ps_filtered with the computed average Shannon values
+sample_data(ps_filtered)$Shannon <- metadata_filtered$Shannon
+
+# Extract metadata for further analysis using ps_filtered
+metadata <- data.frame(sample_data(ps_filtered))
+
+# Filter out any samples with missing Shannon values to avoid plotting warnings
+metadata <- metadata[!is.na(metadata$Shannon), ]
+
+#########test#####
+
+# Print the reference order
+print(reference_order)
+# Print names from one rarefied iteration
+print(names(all_shannon[[5]]))
+
+
+#########test over #######
+
+# Plot Shannon Diversity by tillage_method
+ggplot(metadata, aes(x = tillage_method, y = Shannon, fill = tillage_method)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.7) +
+  geom_jitter(aes(colour = tillage_method), size = 1.5, width = 0.2) +
+  stat_summary(fun = mean, geom = "point", shape = 20, size = 3, colour = "red") +
+  labs(
+    title = "Shannon Diversity by Tillage method",
+    x = "Tillage method",
+    y = "Shannon Diversity"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+# Perform ANOVA for Shannon Diversity by tillage_method
+anova_tillage_method <- aov(Shannon ~ tillage_method, data = metadata)
+summary(anova_tillage_method)
+
+
+# Plot Shannon Diversity by fertiliser_use
+ggplot(metadata, aes(x = fertiliser_use, y = Shannon, fill = fertiliser_use)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.7) +
+  geom_jitter(aes(colour = fertiliser_use), size = 1.5, width = 0.2) +
+  stat_summary(fun = mean, geom = "point", shape = 20, size = 3, colour = "red") +
+  labs(
+    title = "Shannon Diversity by Fertiliser use",
+    x = "Fertiliser use ",
+    y = "Shannon Diversity"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+# Perform ANOVA for Shannon Diversity by fertiliser_use
+anova_fertiliser_use <- aov(Shannon ~ fertiliser_use, data = metadata)
+summary(anova_fertiliser_use)
+
+# Plot Shannon Diversity by take_all_seen
+ggplot(metadata, aes(x = take_all_seen, y = Shannon, fill = take_all_seen)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.7) +
+  geom_jitter(aes(colour = take_all_seen), size = 1.5, width = 0.2) +
+  stat_summary(fun = mean, geom = "point", shape = 20, size = 3, colour = "red") +
+  labs(
+    title = "Shannon Diversity by Take-All observed",
+    x = "Take-All seen",
+    y = "Shannon Diversity"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+# Perform ANOVA for Shannon Diversity by take_all_seen
+anova_take_all_seen <- aov(Shannon ~ take_all_seen, data = metadata)
+summary(anova_take_all_seen)
+
+# Perform statistical test (ANOVA) for Shannon Diversity
+anova_shannon <- aov(Shannon ~ tillage_method * fertiliser_use, data = metadata)
+summary(anova_shannon)
+
+
+# Produce a single composite plot with facets for each take all scenario
+p_faceted <- ggplot(metadata, aes(x = take_all_seen, y = Shannon)) +
+  geom_boxplot(aes(fill = take_all_seen), outlier.shape = NA, alpha = 0.7) +
+  geom_jitter(aes(colour = take_all_seen), size = 1.5, width = 0.2) +
+  stat_summary(fun = mean, geom = "point", shape = 20, size = 3, colour = "red") +
+  labs(title = "Shannon Diversity by Take All observed vs Fertiliser Use",
+       x = "Evidence of Take-All observed",
+       y = "Shannon Diversity") +
+  facet_wrap(~ fertiliser_use, scales = "free_y") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+print(p_faceted)
+
+#Hill diversity analysis
+# Lists to store Hill diversity values
+all_hill_q0 <- list()
+all_hill_q1 <- list()
+all_hill_q2 <- list()
+
+# Loop through rarefied phyloseq objects
+for (i in seq_along(ps_rarefied)) {
+  phy <- ps_rarefied[[i]]
+  
+  # Extract OTU table (ensure samples are rows)
+  otu <- as(otu_table(phy), "matrix")
+  if (taxa_are_rows(phy)) { otu <- t(otu) }
+  
+  # Compute Hill numbers
+  hill_q0 <- hillR::hill_taxa(otu, q = 0)
+  hill_q1 <- hillR::hill_taxa(otu, q = 1)
+  hill_q2 <- hillR::hill_taxa(otu, q = 2)
+  
+  # Align order with reference
+  all_shannon[[i]] <- vegan::diversity(otu, "shannon")[reference_order]
+  all_hill_q0[[i]] <- hill_q0[reference_order]
+  all_hill_q1[[i]] <- hill_q1[reference_order]
+  all_hill_q2[[i]] <- hill_q2[reference_order]
+}
+
+# Calculate averages
+metadata_filtered$Shannon <- rowMeans(do.call(cbind, all_shannon), na.rm = TRUE)
+metadata_filtered$Hill_q0 <- rowMeans(do.call(cbind, all_hill_q0), na.rm = TRUE)
+metadata_filtered$Hill_q1 <- rowMeans(do.call(cbind, all_hill_q1), na.rm = TRUE)
+metadata_filtered$Hill_q2 <- rowMeans(do.call(cbind, all_hill_q2), na.rm = TRUE)
+
+# Update phyloseq object
+sample_data(ps_filtered)$Shannon <- metadata_filtered$Shannon
+sample_data(ps_filtered)$Hill_q0 <- metadata_filtered$Hill_q0
+sample_data(ps_filtered)$Hill_q1 <- metadata_filtered$Hill_q1
+sample_data(ps_filtered)$Hill_q2 <- metadata_filtered$Hill_q2
+
+# Convert metadata to long format for Hill numbers
+hill_long <- metadata_filtered %>%
+  pivot_longer(
+    cols = c(Shannon, Hill_q0, Hill_q1, Hill_q2),
+    names_to = "Metric",
+    values_to = "Value"
+  ) %>%
+  mutate(Metric = factor(Metric, 
+                         levels = c("Hill_q0", "Hill_q1", "Hill_q2", "Shannon"),
+                         labels = c("Hill q=0 (Richness)", "Hill q=1 (Shannon)", 
+                                    "Hill q=2 (Simpson)", "Shannon Diversity"))
+  )
+
+# Plot Hill diversity by take_all_seen
+ggplot(hill_long, aes(x = take_all_seen, y = Value, fill = take_all_seen)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.7) +
+  geom_jitter(aes(color = take_all_seen), width = 0.2, size = 1.5) +
+  facet_wrap(~Metric, scales = "free_y", ncol = 2) +
+  labs(title = "Alpha Diversity by Observation of Take All",
+       x = "", y = "Diversity Value") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+# Perform ANOVA for all metrics
+anova_results <- list(
+  Hill_q0 = aov(Hill_q0 ~ take_all_seen * fertiliser_use, data = metadata_filtered),
+  Hill_q1 = aov(Hill_q1 ~ take_all_seen * fertiliser_use, data = metadata_filtered),
+  Hill_q2 = aov(Hill_q2 ~ take_all_seen * fertiliser_use, data = metadata_filtered),
+  Shannon = aov(Shannon ~ take_all_seen * fertiliser_use, data = metadata_filtered)
+)
+
+# Print summary
+lapply(anova_results, function(x) summary(x))
+
+# Hill diversity based on observed take-all - split by the different fertiliser use condition
+
+# ======================================================================
+# STRATIFIED HILL DIVERSITY ANALYSIS BY Take all Observation AND Fertiliser use
+# ======================================================================
+
+# 1. Prepare Metadata with Hill Numbers
+metadata_stratified <- data.frame(sample_data(ps_filtered)) %>%
+  dplyr::select(
+    take_all_seen,         # Replace with your actual metadata column name for experimental conditions
+    fertiliser_use,      # Replace with your actual time column name
+    Hill_q0, 
+    Hill_q1, 
+    Hill_q2
+  ) %>%
+  tibble::rownames_to_column("SampleID") %>%  # Add SampleID from row names
+  tidyr::drop_na()  # Remove samples with missing data
+
+# 2. Calculate Mean and SE for Hill Numbers by Take all observation & Fertiliser use
+hill_stratified <- metadata_stratified %>%
+  group_by(take_all_seen, fertiliser_use) %>%
+  summarise(
+    Hill_q0_mean = mean(Hill_q0, na.rm = TRUE),
+    Hill_q1_mean = mean(Hill_q1, na.rm = TRUE),
+    Hill_q2_mean = mean(Hill_q2, na.rm = TRUE),
+    Hill_q0_se = sd(Hill_q0, na.rm = TRUE) / sqrt(n()),
+    Hill_q1_se = sd(Hill_q1, na.rm = TRUE) / sqrt(n()),
+    Hill_q2_se = sd(Hill_q2, na.rm = TRUE) / sqrt(n()),
+    .groups = "drop"
+  )
+
+# 3. Plot Hill Diversity of Fertiliser use based on whether Take-all is observed or not 
+# ---------------------------------------------------------
+
+# First, rename columns to simplify splitting
+hill_stratified_renamed <- hill_stratified %>%
+  rename_with(~ gsub("Hill_", "", .x), -c(take_all_seen, fertiliser_use))
+
+# Now pivot and plot
+hill_plot <- hill_stratified_renamed %>%
+  pivot_longer(
+    cols = -c(take_all_seen, fertiliser_use),
+    names_to = c("Metric", ".value"),
+    names_sep = "_"
+  ) %>%
+  mutate(
+    Metric = factor(Metric,
+                    levels = c("q0", "q1", "q2"),
+                    labels = c("Hill q=0 (Richness)", "Hill q=1 (Shannon)", "Hill q=2 (Simpson)")
+    )
+  ) %>%
+  ggplot(aes(x = fertiliser_use, y = mean, group = take_all_seen, color = take_all_seen)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = mean - se, ymax = mean + se), width = 0.2) +
+  facet_grid(Metric ~ take_all_seen, scales = "free_y") +
+  labs(
+    title = "Hill Diversity by Observed Take-All and Fertiliser use",
+    x = "Fertiliser Use",
+    y = "Effective Number of Species",
+    color = "take_all_seen"
+  ) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.background = element_blank()
+  )
+
+print(hill_plot)
+
+# 4. Statistical Tests for Each Condition
+hill_stats <- list()
+
+for (take in unique(metadata_stratified$take_all_seen)) {
+  # Subset data for current condition
+  take_data <- filter(metadata_stratified, take_all_seen == take)
+  
+  # ANOVA + Tukey HSD for each Hill metric
+  stats_take <- list(
+    Hill_q0 = aov(Hill_q0 ~ fertiliser_use, data = take_data) %>% TukeyHSD(),
+    Hill_q1 = aov(Hill_q1 ~ fertiliser_use, data = take_data) %>% TukeyHSD(),
+    Hill_q2 = aov(Hill_q2 ~ fertiliser_use, data = take_data) %>% TukeyHSD()
+  )
+  
+  hill_stats[[take]] <- stats_take
+}
+
+# View results for 0C condition (example)
+print(hill_stats[["0C"]])
+
+### plot the Hill diversity stats ##
+
+# ======================================================================
+# VISUALIZE SIGNIFICANT HILL DIVERSITY DIFFERENCES ACROSS ALL CONDITIONS
+# ======================================================================
+
+
+# 1. Extract Significant Results
+extract_significant <- function(hill_stats, alpha = 0.05) {
+  # Initialize empty list to store results
+  sig_results <- list()
+  
+  # Check input validity
+  if (is.null(hill_stats)) stop("hill_stats is NULL. Run statistical tests first.")
+  if (!is.list(hill_stats)) stop("hill_stats must be a list of condition results.")
+  
+  # Iterate through all conditions
+  for (take in names(hill_stats)) {
+    # Check if condition exists
+    if (is.null(hill_stats[[take]])) {
+      warning(paste("Take all seen", take, "not found in hill_stats. Skipping."))
+      next
+    }
+    
+    # Iterate through Hill metrics
+    for (metric in c("Hill_q0", "Hill_q1", "Hill_q2")) {
+      # Check if metric exists for current condition
+      if (!metric %in% names(hill_stats[[take]])) {
+        warning(paste("Metric", metric, "missing in condition", take, ". Skipping."))
+        next
+      }
+      
+      # Extract Tukey HSD results safely
+      tukey_res <- tryCatch(
+        {
+          hill_stats[[take]][[metric]]$sampling_time
+        },
+        error = function(e) {
+          warning(paste("Failed to extract", metric, "for", take, ":", e$message))
+          NULL
+        }
+      )
+      
+      # Skip if results are invalid
+      if (is.null(tukey_res)) next
+      
+      # Convert to dataframe and rename p-value column
+      tukey_df <- as.data.frame(tukey_res) %>%
+        rownames_to_column("comparison") %>%
+        rename(p.adj = `p adj`) %>%  # Fix column name (space to dot)
+        mutate(
+          condition = take,
+          metric = metric,
+          comparison = gsub("-", " vs. ", comparison)
+        ) %>%
+        filter(p.adj < alpha)  # Now using the renamed column
+      
+      if (nrow(tukey_df) > 0) {
+        sig_results[[paste(take, metric)]] <- tukey_df
+      }
+    }
+  }
+  
+  if (length(sig_results) == 0) {
+    message("No significant results found at alpha = ", alpha)
+    return(NULL)
+  } else {
+    return(bind_rows(sig_results))
+  }
+}
+
+# 2. Extract & Clean Results 
+alpha_threshold <- 0.05
+sig_results <- extract_significant(hill_stats, alpha_threshold)
+
+# Proceed only if results exist
+if (!is.null(sig_results)) {
+  # Clean labels
+  sig_results <- sig_results %>%
+    mutate(
+      metric = case_when(
+        metric == "Hill_q0" ~ "Richness (q=0)",
+        metric == "Hill_q1" ~ "Shannon (q=1)",
+        metric == "Hill_q2" ~ "Simpson (q=2)",
+        TRUE ~ metric
+      ),
+      take_all_seen = gsub("_", " ", take_all_seen)
+    )
+  
+  # 3. Visualization 
+  hill_sig_plot <- ggplot(sig_results, aes(x = comparison, y = diff)) +
+    geom_pointrange(
+      aes(ymin = lwr, ymax = upr, color = metric),
+      position = position_dodge(width = 0.6),
+      size = 0.6
+    ) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "red", linewidth = 0.4) +
+    facet_grid(
+      take_all_seen ~ metric,
+      scales = "free",
+      labeller = labeller(metric = label_wrap_gen(20))
+    ) +
+    labs(
+      title = "Significant Differences in Hill Diversity Metrics",
+      subtitle = paste("Tukey HSD post-hoc tests | p <", alpha_threshold),
+      x = "Fertiliser use",
+      y = "Mean Difference",
+      color = "Diversity Metric"
+    ) +
+    theme_bw() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+      strip.text = element_text(size = 9, face = "bold"),
+      legend.position = "bottom"
+    ) +
+    scale_color_manual(values = c("#E69F00", "#56B4E9", "#009E73"))
+  
+  print(hill_sig_plot)
+  ggsave("significant_hill_differences.png", width = 14, height = 10, dpi = 300)
+  
+} else {
+  message("No significant results to plot at alpha = ", alpha_threshold)
+}
+
+
+#### NMDS ####
+# Compute Bray–Curtis distance from the filtered (unrarefied) data
+bray_dist <- distance(ps_filtered, method = "bray")
+bray_dist <- phyloseq::distance(ps_filtered, method = "bray")
+
+
+# Print outlier samples (if any)
+if (length(outliers) > 0) {
+  cat("Outliers detected:", names(outliers), "\n")
+} else {
+  cat("No outliers detected.\n")
+}
+### Step 2: Remove Outliers (Optional) ###
+ps_clean <- ps_filtered
+if (length(outliers) > 0) {
+  ps_clean <- subset_samples(ps_filtered, !(sample_names(ps_filtered) %in% names(outliers)))
+  bray_dist <- phyloseq::distance(ps_clean, method = "bray")
+}
+
+
+# Run NMDS with two dimensions. Increase trymax for robustness.
+nmds_result <- metaMDS(bray_dist, k = 2, trymax = 100)
+
+# Extract NMDS scores (coordinates) for each sample
+nmds_scores <- as.data.frame(scores(nmds_result))
+# Add sample metadata to the NMDS scores
+nmds_scores <- cbind(nmds_scores, sample_data(ps_filtered))
+
+
+
+
+library(phyloseq)
+library(vegan)
+library(ggplot2)
+library(dplyr)
+
+# 1. Compute Bray-Curtis distance properly
+bray_dist <- phyloseq::distance(ps_filtered, method = "bray")
+
+# 2. Get sample names from distance matrix FIRST
+dist_samples <- rownames(as.matrix(bray_dist))
+
+# 3. Prepare metadata - convert to data frame and filter matching samples
+metadata <- sample_data(ps_filtered) %>% 
+  as("data.frame") %>% 
+  filter(rownames(.) %in% dist_samples)  # Only keep samples in distance matrix
+
+# 4. Verify matching dimensions
+stopifnot(nrow(metadata) == length(dist_samples))  # Should be TRUE
+
+# 5. Run NMDS
+nmds_result <- metaMDS(bray_dist, k = 2, trymax = 100)
+nmds_scores <- as.data.frame(scores(nmds_result, "sites"))
+
+# 6. Merge with metadata - ensuring perfect alignment
+nmds_scores <- cbind(nmds_scores, metadata[dist_samples, ])
+
+# 7. Create plot with proper aesthetics
+ggplot(nmds_scores, aes(x = NMDS1, y = NMDS2, 
+                        color = take_all_seen, 
+                        shape = tillage_method)) +
+  geom_point(size = 3) +
+  stat_ellipse() +
+  labs(title = "NMDS Plot (Bray-Curtis)",
+       subtitle = paste("Stress =", round(nmds_result$stress, 3))) +
+  theme_minimal()
+
+
+
+
+
+# Relative abundance of top taxa over time (GENUS LEVEL)
+
+# 1. Transform counts to relative abundances
+ps_rel <- transform_sample_counts(ps_filtered, function(x) x / sum(x))
+
+# 2. Agglomerate taxa at the GENUS level
+available_ranks <- rank_names(ps_rel)
+if("genus" %in% available_ranks) {
+  ps_genus <- tax_glom(ps_rel, taxrank = "genus")
+} else {
+  stop("'genus' taxonomic rank is not available in your data.")
+}
+
+# 3. Melt the phyloseq object to a long-format data frame
+ps_melt <- psmelt(ps_genus)
+
+# 4. Identify top 25 genera (excluding NA and "Other")
+top25_genera <- ps_melt %>%
+  filter(!is.na(genus), genus != "Other") %>%
+  group_by(genus) %>%
+  summarise(Total = sum(Abundance)) %>%
+  arrange(desc(Total)) %>%
+  slice(1:25) %>%
+  pull(genus)
+
+# 5. Filter the melted data to include only top genera (no "Other" used)
+ps_melt_filtered <- ps_melt %>%
+  filter(genus %in% top25_genera) %>%
+  mutate(
+    genus = factor(genus, levels = top25_genera)  # Set order for plotting and legend
+  )
+
+# 6. Define color palette for the top genera only
+n_actual_genera <- length(top25_genera)
+genera_colors <- scales::hue_pal()(n_actual_genera)
+names(genera_colors) <- top25_genera
+
+# 7. Plot without "Other"
+relabund_plot <- ggplot(ps_melt_filtered, aes(x = project, y = Abundance, fill = genus)) +
+  geom_bar(stat = "identity", position = position_fill(reverse = TRUE)) +
+  facet_wrap(~ take_all_seen, ncol = 3) +
+  scale_fill_manual(
+    name = "Genus",
+    values = genera_colors,
+    drop = FALSE
+  ) +
+  labs(
+    title = "Relative Abundance of Top 25 Genera Across Site",
+    x = "Site",
+    y = "Relative Abundance (%)"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "right",
+    legend.text = element_text(size = 6.5)
+  ) +
+  guides(fill = guide_legend(ncol = 1)) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1))
+
+# 8. Display the plot
+print(relabund_plot)
+
+
+
+
+
+
+
+
+# Transform counts to relative abundances (unrarefied filtered data)
+ps_rel <- transform_sample_counts(ps_filtered, function(x) x / sum(x))
+
+# Agglomerate taxa at the PHYLUM level
+available_ranks <- rank_names(ps_rel)
+if("phylum" %in% available_ranks) {
+  ps_phylum <- tax_glom(ps_rel, taxrank = "phylum")
+} else {
+  stop("'phylum' taxonomic rank is not available in your data.")
+}
+
+# Melt the phyloseq object to a long-format data frame for plotting
+ps_melt <- psmelt(ps_phylum)
+
+# Identify top phyla (excluding NA and "Other" if present)
+top_phyla <- ps_melt %>%
+  filter(!is.na(phylum) & phylum != "Other") %>%
+  group_by(phylum) %>%
+  summarise(Total = sum(Abundance)) %>%
+  arrange(desc(Total)) %>%
+  slice(1:15) %>%  # You can adjust this number if needed
+  pull(phylum)
+
+# Create TaxaGroup for plotting
+ps_melt <- ps_melt %>%
+  mutate(
+    TaxaGroup = if_else(phylum %in% top_phyla, as.character(phylum), "Other"),
+    TaxaGroup = replace_na(TaxaGroup, "Other"),
+    TaxaGroup = factor(TaxaGroup, levels = c("Other", top_phyla))
+  )
+
+# Create color palette
+n_actual_phyla <- length(top_phyla)
+phyla_colors <- scales::hue_pal()(n_actual_phyla)
+names(phyla_colors) <- top_phyla
+fill_colors <- phyla_colors
+
+# Create the relative abundance plot
+relabund_plot <- ggplot(ps_melt, aes(x = project, y = Abundance, fill = TaxaGroup)) +
+  geom_bar(stat = "identity", position = position_fill(reverse = TRUE)) +
+  facet_wrap(~ take_all_seen, ncol = 3) +
+  scale_fill_manual(
+    name = "Phyla",
+    values = fill_colors,
+    drop = FALSE
+  ) +
+  labs(
+    title = "Relative Abundance of Top Phyla Across Site",
+    x = "Site",
+    y = "Relative Abundance (%)"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "right",
+    legend.text = element_text(size = 6.5)
+  ) +
+  guides(fill = guide_legend(ncol = 1)) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1))
+
+print(relabund_plot)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Relative abundance of top taxa over time
+
+# Transform counts to relative abundances (unrarefied filtered data)
+ps_rel <- transform_sample_counts(ps_filtered, function(x) x / sum(x))
+
+# Agglomerate taxa at the genus level
+available_ranks <- rank_names(ps_rel)
+if("genus" %in% available_ranks) {
+  ps_genus <- tax_glom(ps_rel, taxrank = "order")
+} else {
+  stop("'genus' taxonomic rank is not available in your data.")
+}
+
+# Melt the phyloseq object to a long-format data frame for plotting
+ps_melt <- psmelt(ps_genus)
+
+# 1. Identify TOP TAXA (ensure no "Other" in selection)
+top25_taxa <- ps_melt %>% 
+  filter(order != "Other") %>%  # Explicitly exclude "Other" if present
+  group_by(genus) %>% 
+  summarise(Total = sum(Abundance)) %>% 
+  arrange(desc(Total)) %>% 
+  slice(1:10) %>% 
+  pull(genus)
+
+# 2. Create TaxaGroup with explicit factor levels
+ps_melt <- ps_melt %>%
+  mutate(
+    TaxaGroup = if_else(
+      condition = order %in% top25_taxa,
+      true = as.character(order),
+      false = "Other",
+      missing = "Other"  # Handle NA values
+    ),
+    TaxaGroup = factor(
+      TaxaGroup,
+      levels = c("Other", top25_taxa)  # Explicit level order
+    )
+  )
+
+# 3. Create COLOR PALETTE with exact level matching
+n_actual_taxa <- length(top25_taxa)  # Might be <25 if data has fewer
+taxa_colors <- scales::hue_pal()(n_actual_taxa)
+names(taxa_colors) <- top25_taxa  # Must match factor levels exactly
+
+# 4. Combine with "Other" color
+fill_colors <- c("Other" = "gray70", taxa_colors)
+
+# 5. Create plot with FORCED color scale
+relabund_plot <- ggplot(ps_melt, aes(x = project, y = Abundance, fill = TaxaGroup)) +
+  geom_bar(stat = "identity", position = position_fill(reverse = TRUE)) +
+  facet_wrap(~ take_all_seen, ncol = 3) +
+  scale_fill_manual(
+    name = "Taxonomic Orders",
+    values = fill_colors,
+    drop = FALSE  # Show all levels in legend
+  ) +
+  labs(title = "Relative Abundance of Top Orders Across Site",
+       x = "Site",
+       y = "Relative Abundance (%)") +
+  theme_minimal() +
+  theme(legend.position = "right",
+        legend.text = element_text(size = 6.5)) +
+  guides(fill = guide_legend(ncol = 1)) +
+  scale_y_continuous(labels = percent_format(accuracy = 1))
+
+print(relabund_plot)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#------------------------------------------------------------------------------
+# Relative and Absolute Abundance Analysis
+# ---------------------------------------
+
+# Function to aggregate and calculate abundances at a specific taxonomic level
+calculate_abundances <- function(physeq, level) {
+  # Aggregate taxa at the specified level
+  physeq_agg <- tax_glom(physeq, taxrank = level, NArm = FALSE)
+  
+  # Calculate relative abundances (percentages)
+  physeq_rel <- transform_sample_counts(physeq_agg, function(x) x / sum(x) * 100)
+  
+  # Melt the data for plotting
+  rel_melt <- psmelt(physeq_rel)
+  abs_melt <- psmelt(physeq_agg)
+  
+  # Return both relative and absolute abundances
+  list(relative = rel_melt, absolute = abs_melt)
+}
+
+# Calculate abundances at genus and phylum levels
+genus_abundances <- calculate_abundances(ps_filtered, "genus")
+phylum_abundances <- calculate_abundances(ps_filtered, "phylum")
+
+# Plot relative abundance at phylum level
+phylum_abundances$relative %>%
+  group_by(field, phylum) %>%
+  summarize(Abundance = sum(Abundance)) %>%
+  ggplot(aes(x = field, y = Abundance, fill = phylum)) +
+  geom_bar(stat = "identity", position = "stack") +
+  labs(title = "Absolute Abundance at Phylum Level",
+       y = "Absolute Abundance",
+       x = "Sample") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+
+# Plot relative abundance at phylum level
+phylum_abundances$relative %>%
+  group_by(Sample, phylum) %>%
+  summarize(Abundance = sum(Abundance)) %>%
+  ggplot(aes(x = Sample, y = Abundance, fill = phylum)) +
+  geom_bar(stat = "identity", position = "stack") +
+  labs(title = "Absolute Abundance at Phylum Level",
+       y = "Absolute Abundance (%)",
+       x = "Sample") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+
+
+# Plot relative abundance at genus level (top 20 genera)
+top_genera <- genus_abundances$relative %>%
+  group_by(genus) %>%
+  summarize(total = sum(Abundance)) %>%
+  arrange(desc(total)) %>%
+  head(20) %>%
+  pull(genus)
+
+genus_abundances$relative %>%
+  filter(genus %in% top_genera) %>%
+  group_by(Sample, genus) %>%
+  summarize(Abundance = sum(Abundance)) %>%
+  ggplot(aes(x = Sample, y = Abundance, fill = genus)) +
+  geom_bar(stat = "identity", position = "stack") +
+  labs(title = "Relative Abundance of Top 20 Genera",
+       y = "Relative Abundance (%)",
+       x = "Sample") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+
+# Plot relative abundance at genus level (top 20 genera)
+top_genera <- genus_abundances$relative %>%
+  group_by(genus) %>%
+  summarize(total = sum(Abundance)) %>%
+  arrange(desc(total)) %>%
+  head(20) %>%
+  pull(genus)
+
+genus_abundances$relative %>%
+  filter(genus != "NA") %>%  # Explicitly exclude "NA" if present
+  filter(genus %in% top_genera) %>%
+  group_by(field, genus) %>%
+  summarize(Abundance = sum(Abundance)) %>%
+  ggplot(aes(x = field, y = Abundance, fill = genus)) +
+  geom_bar(stat = "identity", position = "stack") +
+  labs(title = "Absolute Abundance of Top 20 Genera",
+       y = "Absolute Abundance (%)",
+       x = "Sample") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+
+
+
+
+
+
+
+
+# Overall Phylum Diversity Analysis
+# ---------------------------------
+
+
+# Corrected phylum diversity calculation
+phylum_diversity <- phylum_abundances$absolute %>%
+  group_by(Sample, phylum) %>%
+  summarize(Abundance = sum(Abundance), .groups = "drop") %>%  # Added .groups = "drop"
+  group_by(Sample) %>%
+  summarize(
+    phylum_richness = n_distinct(phylum),
+    phylum_shannon = vegan::diversity(Abundance),  # Default is Shannon
+    phylum_simpson = vegan::diversity(Abundance, index = "simpson"),  # Simpson uses index param
+    .groups = "drop"  # Avoid grouping message
+  )
+
+# Merge with metadata
+phylum_diversity <- left_join(phylum_diversity, 
+                              data.frame(sample_data(ps_filtered)) %>% 
+                                rownames_to_column("Sample"),
+                              by = "Sample")
+
+# Plot phylum richness by site
+ggplot(phylum_diversity, aes(x = field, y = phylum_richness, fill = field)) +
+  geom_boxplot() +
+  geom_jitter(width = 0.2) +
+  labs(title = "Phylum Richness by Fields",
+       y = "Number of Phyla",
+       x = "Field") +
+  theme_minimal()
+
+
+# Plot phylum Shannon diversity by tillage method
+ggplot(phylum_diversity, aes(x = field, y = phylum_shannon, fill = field)) +
+  geom_boxplot() +
+  geom_jitter(width = 0.2) +
+  labs(title = "Phylum Shannon Diversity by Field",
+       y = "Shannon Diversity Index",
+       x = "Field") +
+  theme_minimal()
+
+
+
+
+
+
+
+
+  # Corrected phylum diversity calculation
+  phylum_diversity <- phylum_abundances$absolute %>%
+  group_by(Sample, phylum) %>%
+  summarize(Abundance = sum(Abundance), .groups = "drop") %>%  # Added .groups = "drop"
+  group_by(Sample) %>%
+  summarize(
+    phylum_richness = n_distinct(phylum),
+    phylum_shannon = vegan::diversity(Abundance),  # Default is Shannon
+    phylum_simpson = vegan::diversity(Abundance, index = "simpson"),  # Simpson uses index param
+    .groups = "drop"  # Avoid grouping message
+  )
+
+
+
+# Merge with metadata
+phylum_diversity <- left_join(phylum_diversity, 
+                              data.frame(sample_data(ps_filtered)) %>% 
+                                rownames_to_column("Sample"),
+                              by = "Sample")
+
+# Plot phylum richness by tillage method
+ggplot(phylum_diversity, aes(x = tillage_method, y = phylum_richness, fill = tillage_method)) +
+  geom_boxplot() +
+  geom_jitter(width = 0.2) +
+  labs(title = "Phylum Richness by Tillage Method",
+       y = "Number of Phyla",
+       x = "Tillage Method") +
+  theme_minimal()
+
+# Plot phylum Shannon diversity by tillage method
+ggplot(phylum_diversity, aes(x = tillage_method, y = phylum_shannon, fill = tillage_method)) +
+  geom_boxplot() +
+  geom_jitter(width = 0.2) +
+  labs(title = "Phylum Shannon Diversity by Tillage Method",
+       y = "Shannon Diversity Index",
+       x = "Tillage Method") +
+  theme_minimal()
+
+
+
+
+
+
+# Plot relative abundance at genus level (top 20 genera)
+top_genera <- genus_abundances$relative %>%
+  group_by(genus) %>%
+  summarize(total = sum(Abundance)) %>%
+  arrange(desc(total)) %>%
+  head(20) %>%
+  pull(genus)
+
+genus_abundances$relative %>%
+  filter(genus %in% top_genera) %>%
+  group_by(Sample, genus) %>%
+  summarize(Abundance = sum(Abundance)) %>%
+  ggplot(aes(x = Sample, y = Abundance, fill = genus)) +
+  geom_bar(stat = "identity", position = "stack") +
+  labs(title = "Relative Abundance of Top 20 Genera",
+       y = "Relative Abundance (%)",
+       x = "Sample") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+
+# Plot relative abundance at genus level (top 20 genera)
+top_genera <- genus_abundances$relative %>%
+  group_by(genus) %>%
+  summarize(total = sum(Abundance)) %>%
+  arrange(desc(total)) %>%
+  head(20) %>%
+  pull(genus)
+
+genus_abundances$relative %>%
+  filter(genus %in% top_genera) %>%
+  group_by(field, genus) %>%
+  summarize(Abundance = sum(Abundance)) %>%
+  ggplot(aes(x = field, y = Abundance, fill = genus)) +
+  geom_bar(stat = "identity", position = "stack") +
+  labs(title = "Relative Abundance of Top 20 Genera",
+       y = "Relative Abundance (%)",
+       x = "Sample") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+# Corrected genus diversity calculation
+genus_diversity <- genus_abundances$absolute %>%
+  group_by(Sample, genus) %>%
+  summarize(Abundance = sum(Abundance), .groups = "drop") %>%
+  group_by(Sample) %>%
+  summarize(
+    genus_richness = n_distinct(genus),
+    genus_shannon = vegan::diversity(Abundance),  # Default is Shannon
+    genus_simpson = vegan::diversity(Abundance, index = "simpson"),
+    .groups = "drop"
+  )
+
+# Merge with metadata
+genus_diversity <- left_join(genus_diversity, 
+                             data.frame(sample_data(ps_filtered)) %>% 
+                               rownames_to_column("Sample"),
+                             by = "Sample")
+
+
+
+
+# Plot genus richness by field
+ggplot(genus_diversity, aes(x = field, y = genus_richness, fill = field)) +
+  geom_boxplot() +
+  geom_jitter(width = 0.2) +
+  labs(title = "Genus Richness by Field",
+       y = "Number of Genera",
+       x = "Field") +
+  theme_minimal()
+
+# Plot genus Shannon diversity by field
+ggplot(genus_diversity, aes(x = field, y = genus_shannon, fill = field)) +
+  geom_boxplot() +
+  geom_jitter(width = 0.2) +
+  labs(title = "Genus Shannon Diversity by Field",
+       y = "Shannon Diversity Index",
+       x = "Field") +
+  theme_minimal()
+
+
+----------------------------------------------------------------------------
+  
+  
+  # Statistical tests for phylum diversity
+  # ANOVA for phylum richness
+  anova_phylum_richness <- aov(phylum_richness ~ tillage_method, data = phylum_diversity)
+summary(anova_phylum_richness)
+
+# Kruskal-Wallis test if assumptions aren't met
+kruskal.test(phylum_richness ~ tillage_method, data = phylum_diversity)
+
+# Phylum Composition Analysis
+# ---------------------------
+
+# Calculate mean relative abundance by tillage method at phylum level
+phylum_summary <- phylum_abundances$relative %>%
+  group_by(tillage_method, phylum) %>%
+  summarize(mean_abundance = mean(Abundance)) %>%
+  arrange(tillage_method, desc(mean_abundance))
+
+# Plot top phyla by tillage method
+phylum_summary %>%
+  group_by(tillage_method) %>%
+  top_n(5, mean_abundance) %>%
+  ggplot(aes(x = reorder(phylum, mean_abundance), y = mean_abundance, fill = tillage_method)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  facet_wrap(~tillage_method, scales = "free_y") +
+  labs(title = "Top 5 Phyla by Tillage Method",
+       y = "Mean Relative Abundance (%)",
+       x = "Phylum") +
+  theme_minimal()
+
+
+
+
+
+
+
+
+
+# Correct way to calculate Bray-Curtis distances from phyloseq object
+bray_dist <- phyloseq::distance(ps_filtered, method = "bray")
+
+# Alternative if the above still doesn't work:
+# Extract OTU table first
+otu_table <- as(otu_table(ps_filtered), "matrix")
+if(!taxa_are_rows(ps_filtered)) {
+  otu_table <- t(otu_table)  # Transpose if taxa are columns
+}
+bray_dist <- vegdist(otu_table, method = "bray")
+
+# Proceed with NMDS
+nmds_result <- metaMDS(bray_dist, k = 2, trymax = 100)
+stress <- nmds_result$stress
+
+# Prepare plot data
+nmds_scores <- as.data.frame(scores(nmds_result, "sites"))
+metadata <- data.frame(sample_data(ps_filtered))
+plot_data <- cbind(nmds_scores, metadata)
+
+# Basic NMDS plot
+ggplot(plot_data, aes(x = NMDS1, y = NMDS2)) +
+  geom_point(size = 3) +
+  labs(title = paste("NMDS Plot (Stress =", round(stress, 3), ")"),
+       subtitle = "Bray-Curtis Dissimilarity") +
+  theme_minimal()
+
+
+# Install the package if needed
+install.packages("data.table")
+
+# Load the library
+library(data.table)
+
+
+fwrite(genus_diversity, "genus_diversity.csv")
+fwrite(phylum_diversity, "phylum_diversity.csv")
+
+### differential abundance analysis ###
+BiocManager::install("ComplexHeatmap")
+library(ComplexHeatmap)
+
+# Load required packages
+library(phyloseq)
+library(DESeq2)
+library(ggplot2)
+
+# Load required libraries
+library(phyloseq)
+library(DESeq2)
+library(dplyr)
+library(knitr)
+
+# 1. Data Preparation -----------------------------------------------------
+# 1. First check dimensions
+cat("Original dimensions:", ntaxa(ps_clean), "taxa x", nsamples(ps_clean), "samples\n")
+
+# 2. Create proper filtering vector
+# Option A: Filter taxa present in ≥10% of samples (recommended)
+keep_taxa <- rowSums(otu_table(ps_clean) > 0) >= (0.1 * nsamples(ps_clean))
+cat("Taxa to keep:", sum(keep_taxa), "/", length(keep_taxa), "\n")
+
+# Option B: Alternative filter (minimum count threshold)
+# keep_taxa <- rowSums(otu_table(ps_clean)) >= 10  # Keep taxa with ≥10 total reads
+
+# 3. Apply filtering
+ps.filtered <- prune_taxa(keep_taxa, ps_clean)
+cat("Filtered dimensions:", ntaxa(ps.filtered), "taxa x", nsamples(ps.filtered), "samples\n")
+
+# 4. Remove samples with zero reads (if needed)
+ps.filtered <- prune_samples(sample_sums(ps.filtered) > 0, ps.filtered)
+
+
+
+# 2. Differential Abundance Analysis --------------------------------------
+# Example: Compare tillage methods (no-till vs conventional)
+dds <- phyloseq_to_deseq2(
+  ps.filtered,
+  ~ field_ID + tillage_method  # Account for field variability
+)
+
+dds <- DESeq(dds, sfType = "poscounts")
+
+# Get results for tillage comparison
+res_tillage <- results(dds,
+                       contrast = c("tillage_method", "no-till", "conventional"),
+                       alpha = 0.05)
+
+# Extract significant taxa (padj < 0.05 & |log2FC| > 1)
+sig_taxa <- subset(res_tillage, padj < 0.05 & abs(log2FoldChange) > 1) %>%
+  arrange(padj, desc(abs(log2FoldChange)))
+
+# 3. Generate Report -----------------------------------------------------
+output_file <- "soil_microbiome_report.md"
+
+sink(output_file)
+
+cat("# Soil Microbiome Analysis Report\n\n")
+
+cat("## Key Variables\n")
+cat("- **Fields**:", paste(unique(sample_data(ps.filtered)$field_ID), collapse = ", "), "\n")
+cat("- **Tillage Methods**:", paste(unique(sample_data(ps.filtered)$tillage_method), collapse = ", "), "\n")
+cat("- **Fertilizer Types**:", paste(unique(sample_data(ps.filtered)$fertilizer_type), collapse = ", "), "\n\n")
+
+cat("## Differentially Abundant Taxa (Tillage Comparison)\n")
+cat(paste0("- ", rownames(sig_taxa), collapse = "\n"))
+cat("\n\n")
+
+cat("## Phylum Distribution\n")
+phyla_counts <- tax_table(ps.filtered) %>% 
+  as.data.frame() %>%
+  count(Phylum) %>%
+  arrange(desc(n))
+
+cat(paste0("- ", phyla_counts$Phylum, " (n=", phyla_counts$n, ")", collapse = "\n"))
+cat("\n\n")
+
+cat("## Top 5 Taxa by Abundance\n")
+top_taxa <- names(sort(taxa_sums(ps.filtered), decreasing = TRUE)[1:5]
+                  cat(paste0("- ", top_taxa, collapse = "\n"))
+                  cat("\n\n")
+                  
+                  cat("## Log2 Fold Changes (No-Till vs Conventional)\n")
+                  cat("```\n")
+                  print(head(sig_taxa[, c("log2FoldChange", "padj")], 5))
+                  cat("```\n")
+                  
+                  sink()
+                  
+                  # 4. Visualization -------------------------------------------------------
+                  # Heatmap of significant taxa
+                  ps.rel <- transform_sample_counts(ps.filtered, function(x) x/sum(x)*100)
+                  ps.sig <- prune_taxa(rownames(sig_taxa), ps.rel)
+                  
+                  plot_heatmap(ps.sig,
+                               sample.label = "field_ID",
+                               taxa.label = "Genus",
+                               sample.order = "tillage_method") +
+                    facet_grid(~fertilizer_type, scales = "free_x")
+
+
+#### Mantel test beginning with matching the phyloseq and metadata file
+install.packages(c("geosphere", "lubridate"))
+
+# Load packages
+library(lubridate)
+library(geosphere)
+
+rownames(metadata_filtered)
+
+length(rownames(ps_filtered@otu_table))
+
+matched=match(rownames(ps_filtered@otu_table),rownames(metadata))
+
+###View first 10 rows
+metadata_clean=metadata_filtered[matched[1:10],]
+metadata_clean=metadata_filtered[matched,]
+
+coords <- metadata_clean[, c("gps_latitude", "gps_longitude")]
+geo_dist <- distm(coords, fun = distHaversine)
+geo_dist <- as.dist(geo_dist)
+
+
+ps_filtered@otu_table
+
+##perform Bray-Curtis Dissimilarity
+otu_dist <- vegdist(ps_filtered@otu_table, method = "bray")# Bray-Curtis dissimilarity
+
+mantel(geo_dist,otu_dist)
+
+plot(as.numeric(geo_dist),as.numeric(otu_dist))
+
+##### Color plot for Mantel test ####
+## Perform Bray-Curtis Dissimilarity
+otu_dist <- vegdist(ps_filtered@otu_table, method = "bray") # Bray-Curtis dissimilarity
+
+## Mantel test
+mantel_result <- mantel(geo_dist, otu_dist)
+print(mantel_result) # Show Mantel test results
+
+## Create a color vector based on your grouping variable
+# Example 1: If you have a "field" variable in your sample data
+# (Replace "field" with your actual metadata column name)
+field_colors <- rainbow(length(unique(metadata_filtered$field)))
+names(field_colors) <- unique(metadata_filtered$field)
+point_colors <- field_colors[as.character(metadata_filtered$field)]
+
+# Example 2: If you want to color by another categorical variable
+# group_colors <- c("red", "blue", "green")[as.factor(metadata_clean_subset$your_variable)]
+
+## Enhanced plot with colors and better formatting
+plot(as.numeric(geo_dist), as.numeric(otu_dist),
+     xlab = "Geographic distance (meters)",
+     ylab = "Bray-Curtis dissimilarity",
+     main = "Mantel Test: Geographic vs. Community Distance",
+     pch = 19,  # Solid circles
+     cex = 1.2,  # Point size
+     col = point_colors) # Color by your grouping variable
+
+## Add regression line
+abline(lm(as.numeric(otu_dist) ~ as.numeric(geo_dist)), col = "black", lwd = 2)
+
+## Add legend (if using grouping colors)
+legend("topright", 
+       legend = names(field_colors), 
+       col = field_colors, 
+       pch = 19,
+       title = "Field")
+
+## Add Mantel test statistics to plot
+text(x = max(geo_dist, na.rm = TRUE)*0.7, 
+     y = max(otu_dist, na.rm = TRUE)*0.1,
+     labels = paste("Mantel r =", round(mantel_result$statistic, 3),
+                    "\np =", round(mantel_result$signif, 4)))
+
+
+
+
+
+
+
+###
+
+#anosim
+
+anosim.takeall=anosim(ps_filtered@otu_table,grouping=metadata_filtered$take_all_seen)
+plot((anosim.takeall),
+    xlab = "Take-All Disease Presence", 
+    ylab = "Rank Dissimilarity", 
+    main = "ANOSIM: Microbial Community vs. Take-All Disease")
+
+
+anosim.tillage=anosim(ps_filtered@otu_table,grouping=metadata_filtered$tillage_method)
+plot(anosim.tillage,
+     xlab = "Tillage Method",
+     ylab = "Rank Dissimilarity",
+     main = "ANOSIM: Microbial Community by Tillage Method")
+
+###
+
+adonis.test=adonis2(ps_filtered@otu_table~metadata_filtered$take_all_seen*metadata_filtered$tillage_method)
+
+# PERMANOVA (adonis) 
+# Test if community composition differs significantly across take all seen and tillage method 
+adonis2.test <- adonis2(ps_filtered@otu_table~metadata_filtered$take_all_seen*metadata_filtered$tillage_method)
+print(adonis2.test)
+
+
+#### DISTANCE DECAY PLOT ATTEMPT 1 ####
+
+
+library(geosphere)
+library(ggplot2)
+
+# Compute geographic distance (km)
+geo_dist <- distm(as.matrix(coords), fun = distHaversine) / 1000
+
+# Extract lower triangle of distance matrices
+geo_vec <- as.vector(geo_dist[lower.tri(geo_dist)])
+otu_vec <- as.vector(as.matrix(otu_dist)[lower.tri(otu_dist)])
+
+# Create plot data
+decay_df <- data.frame(Geo = geo_vec, Dissimilarity = otu_vec)
+
+# Plot
+ggplot(decay_df, aes(x = Geo, y = Dissimilarity)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "lm", color = "blue") +
+  labs(title = "Distance-Decay Plot",
+       x = "Geographic Distance (km)",
+       y = "Bray-Curtis Dissimilarity") +
+  theme_minimal()
+
+
+###ATTEMPT 2###
+
+
+# 1. Compute geographic distance (in km)
+geo_dist <- distm(as.matrix(coords), fun = distHaversine) / 1000
+
+# 2. Get sample IDs
+sample_ids <- rownames(coords)
+pairwise_idx <- combn(seq_along(sample_ids), 2)
+
+# 3. Extract distance and dissimilarity
+decay_df <- data.frame(
+  Sample1 = sample_ids[pairwise_idx[1,]],
+  Sample2 = sample_ids[pairwise_idx[2,]],
+  GeoDist = geo_dist[lower.tri(geo_dist)],
+  BrayCurtis = as.vector(as.matrix(otu_dist)[lower.tri(otu_dist)])
+)
+
+# 4. Add metadata for both samples
+metadata_filtered$SampleID <- rownames(metadata_filtered)
+
+decay_df <- decay_df %>%
+  left_join(metadata_filtered, by = c("Sample1" = "SampleID")) %>%
+  rename(Field1 = field, Tillage1 = tillage_method) %>%
+  left_join(metadata_filtered, by = c("Sample2" = "SampleID")) %>%
+  rename(Field2 = field, Tillage2 = tillage_method)
+
+# 5. Keep only comparisons between *different fields*
+decay_df_between <- decay_df %>%
+  filter(Field1 != Field2)
+
+# 6. Create a combined tillage label for plotting
+decay_df_between <- decay_df_between %>%
+  mutate(TillageCombo = paste(Tillage1, "vs", Tillage2))
+
+# 7. Plot with grouping by tillage comparison
+ggplot(decay_df_between, aes(x = GeoDist, y = BrayCurtis, color = TillageCombo)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(title = "Between-Field Distance Decay by Tillage Combination",
+       x = "Geographic Distance (km)",
+       y = "Bray-Curtis Dissimilarity",
+       color = "Tillage Method Comparison") +
+  theme_minimal()
+
+####ATTEMPT 3###
+
+library(geosphere)
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+
+# 1. Compute geographic distance matrix (in km)
+geo_dist <- distm(as.matrix(coords), fun = distHaversine) / 1000
+
+# 2. Get all pairwise combinations of sample indices
+sample_ids <- rownames(coords)
+pairwise_idx <- combn(seq_along(sample_ids), 2)
+
+# 3. Extract pairwise values
+decay_df <- data.frame(
+  Sample1 = sample_ids[pairwise_idx[1,]],
+  Sample2 = sample_ids[pairwise_idx[2,]],
+  GeoDist = geo_dist[lower.tri(geo_dist)],
+  BrayCurtis = as.vector(as.matrix(otu_dist)[lower.tri(otu_dist)])
+)
+metadata_filtered$SampleID <- rownames(metadata_filtered)
+# 4. Add metadata (e.g., tillage method) for both samples
+decay_df <- decay_df %>%
+  left_join(metadata_filtered, by = c("Sample1" = "SampleID")) %>%
+  rename(Treatment1 = tillage_method) %>%
+  left_join(metadata_filtered, by = c("Sample2" = "SampleID")) %>%
+  rename(Treatment2 = tillage_method)
+
+# 5. Optionally filter to within-group comparisons
+decay_df <- decay_df %>%
+  filter(Treatment1 == Treatment2) %>%
+  mutate(Treatment = Treatment1)
+
+# 6. Plot with group-specific regression lines
+ggplot(decay_df, aes(x = GeoDist, y = BrayCurtis, color = Treatment)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(title = "Pairwise Distance Decay by Tillage Method",
+       x = "Geographic Distance (km)",
+       y = "Bray-Curtis Dissimilarity") +
+  theme_minimal() 

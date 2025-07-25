@@ -1,0 +1,56 @@
+# R files
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+*.Rproj
+
+# Data files (keep raw data, ignore processed outputs)
+data/processed/
+outputs/
+*.rds
+*.RDS
+
+# Keep raw data but ignore large sequence files if not needed
+# data/raw/*.fastq
+# data/raw/*.fasta
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*~
+*.tmp
+*.temp
+
+# Log files
+*.log
+
+# R environment
+renv/
+.Rprofile
+
+# Output files (plots and reports)
+outputs/figures/
+outputs/tables/
+outputs/reports/
+*.png
+*.pdf
+*.jpg
+*.jpeg
+*.tiff
+*.svg
+
+# Excel temporary files
+~$*.xlsx
+~$*.xls
+
+# IDE files
+.vscode/
+.idea/
+
+# Backup files
+*_backup
+*_ORIGINAL*
+*copy*

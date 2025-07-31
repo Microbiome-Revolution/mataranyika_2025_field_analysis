@@ -30,6 +30,7 @@ This repository contains the analysis pipeline for 16S rRNA gene sequencing data
 │   ├── 07_statistical_tests.R   # ANOVA, PERMANOVA, etc.
 │   ├── 08_differential_abundance.R # DESeq2 analysis
 │   └── 09_spatial_analysis.R    # Mantel tests, distance decay
+|   └── 10_core_microbiome.R    # Network visualization (to be discussed as an option)
 ├── functions/                   # Custom R functions
 │   ├── plotting_functions.R
 │   ├── analysis_functions.R

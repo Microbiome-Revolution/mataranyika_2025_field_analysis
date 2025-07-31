@@ -53,7 +53,7 @@ This repository contains the analysis pipeline for 16S rRNA gene sequencing data
 - **Study Design**: Agricultural fields with different cropping histories, take-all history, soil profiles, tillage methods and fertilizer treatments
 - **Response Variable**: Take-all disease presence/absence
 - **Sequencing**: 16S rRNA gene amplicon sequencing
-- **Samples**: [Add number] soil samples from [Add number] fields
+- **Samples**: [1084] soil samples from [84] fields
 
 ## Key Analyses
 - Alpha diversity (Shannon, Hill numbers)
@@ -61,6 +61,7 @@ This repository contains the analysis pipeline for 16S rRNA gene sequencing data
 - Taxonomic composition
 - Differential abundance analysis
 - Spatial autocorrelation (Mantel tests)
+- Core microbiomes (????)
 
 ## Dependencies
 See `01_setup_environment.R` for required packages.

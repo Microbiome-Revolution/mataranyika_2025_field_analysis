@@ -1,0 +1,44 @@
+# First, filter the samples to only include 9HF.01.01-9HF.01.10
+sample_name <- c(paste0("9HF.01.0", 1:9), "9HF.01.10") # Creates "9HF.01.01" through "9HF.01.10"
+#sample_name <- sample_name[sample_name != "9HF.01.05"] # get rid of the missing sample 
+
+# get the sample names from the phyloseq object
+new_names <- sample_names(sample_data(ps_filtered)[sample_data(ps_filtered)$sample_name %in% sample_name,])
+
+# Subset the phyloseq object
+ps_filtered <- prune_samples(new_names, ps_filtered)
+
+
+# Subset the metadata to match
+metadata_clean <- metadata_filtered[metadata_filtered$sample_name %in% sample_name, ]
+
+# Order metadata rows to match phyloseq sample order
+#metadata_clean <- metadata_clean[match(sample_names, metadata_clean$sample_name), ]
+
+# Calculate geographic distance matrix (omit the following 3 lines for field subsets)
+#coords <- metadata_clean[, c("gps_latitude", "gps_longitude")]
+#geo_dist <- distm(coords, fun = distHaversine)
+#geo_dist <- as.dist(geo_dist)
+
+# Perform Bray-Curtis Dissimilarity
+otu_dist <- vegdist(as.matrix(ps_filtered@otu_table), method = "bray") # Bray-Curtis dissimilarity
+
+# get some distances
+metadata_clean$distance <- as.numeric(gsub("^.*\\.","", metadata_clean$sample_name))
+
+sample_distance <- dist(metadata_clean$distance)
+
+# Run Mantel test
+mantel_result <- mantel(sample_distance, otu_dist, method = "pearson", permutations = 999)
+print(mantel_result) # Show Mantel test results
+
+mantel_result_spearman <- mantel(sample_distance, otu_dist, method = "spearman", permutations = 999)
+print(mantel_result_spearman)
+
+# Create a colored plot for Mantel test
+plot(as.numeric(sample_distance), as.numeric(otu_dist),
+     xlab = "Geographic distance (meters)", 
+     ylab = "Bray-Curtis dissimilarity",
+     main = "Mantel Test: Geographic vs. Community Distance",
+     pch = 19, col = "blue")
+abline(lm(as.numeric(otu_dist) ~ as.numeric(sample_distance)), col = "red")

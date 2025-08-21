@@ -26,7 +26,7 @@ This repository contains the analysis pipeline for 16S rRNA gene sequencing data
 │   ├── 03_quality_control.R     # Filtering and QC
 │   ├── 04_alpha_diversity.R     # Alpha diversity analysis
 │   ├── 05_beta_diversity.R      # Ordination and distance analysis
-│   ├── 06_taxonomic_composition.R # Relative abundance plots
+│   ├── 06_taxonomic_composition.R # Relative abundance plots, heat maps
 │   ├── 07_statistical_tests.R   # ANOVA, PERMANOVA, etc.
 │   ├── 08_differential_abundance.R # DESeq2 analysis
 │   └── 09_spatial_analysis.R    # Mantel tests, distance decay

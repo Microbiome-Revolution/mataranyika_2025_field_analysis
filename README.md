@@ -1,7 +1,7 @@
-# Mataranyika et al. 2025 - 16S rRNA Field Analysis
+# Mataranyika et al. 2025 - 16S DNA Field Analysis
 
 ## Project Overview
-This repository contains the analysis pipeline for 16S rRNA gene sequencing data from agricultural field samples, investigating the relationship between tillage methods, fertilizer use, and soil microbial communities in relation to take-all disease and Gt presence in soil.
+This repository contains the analysis pipeline for 16S DNA gene sequencing data from agricultural field samples, investigating the relationship between tillage methods, fertilizer use, and soil microbial communities in relation to take-all disease and Gt presence in soil.
 
 ## Key Questions
 1. How do the microbial communities differ between soils with and without farmer reported history of observed take-all, and in relation to baiting trials?

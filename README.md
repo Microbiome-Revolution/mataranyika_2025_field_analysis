@@ -28,9 +28,9 @@ This repository contains the analysis pipeline for 16S DNA gene sequencing data 
 │   ├── 05_beta_diversity.R      # Ordination and distance analysis
 │   ├── 06_taxonomic_composition.R # Relative abundance plots, heat maps
 │   ├── 07_statistical_tests.R   # ANOVA, PERMANOVA, etc.
-│   ├── 08_differential_abundance.R # DESeq2 analysis
-│   └── 09_spatial_analysis.R    # Mantel tests, distance decay
-|   └── 10_core_microbiome.R    # Network visualization (to be discussed as an option)
+│   ├── 08_spatial_analysis.R    # Mantel tests, distance decay
+│   └── 09_core_microbiome.R     # Network visualization (to be discussed as an option)
+|   └── 10_linear_regression     #Consider in relation to environmental conditions
 ├── functions/                   # Custom R functions
 │   ├── plotting_functions.R
 │   ├── analysis_functions.R

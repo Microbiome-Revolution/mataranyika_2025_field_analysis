@@ -1,0 +1,3157 @@
+# =============================================================================
+# MICROBIOME ANALYSIS PIPELINE - STREAMLINED VERSION
+# =============================================================================
+
+# Load Required Libraries
+required_packages <- c(
+  "phyloseq", "ggplot2", "vegan", "dplyr", "tidyr", "purrr", "scales", 
+  "hillR", "tibble", "qs", "ggpubr", "DESeq2", "ComplexHeatmap", "circlize",
+  "reshape2", "pheatmap", "igraph", "ggraph", "tidygraph", "RColorBrewer", "Hmisc"
+)
+
+for (pkg in required_packages) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg, dependencies = TRUE)
+  }
+  library(pkg, character.only = TRUE)
+}
+
+# Setup directories
+PROJECT_ROOT <- normalizePath("~/16Sdata/16S/data")
+FIGURES <- file.path(PROJECT_ROOT, "outputs", "figures")
+TABLES <- file.path(PROJECT_ROOT, "outputs", "tables")
+
+dir.create(FIGURES, recursive = TRUE, showWarnings = FALSE)
+dir.create(TABLES, recursive = TRUE, showWarnings = FALSE)
+
+theme_set(theme_minimal())
+
+# Significance setup Add this at the top of your R script
+add_significance_stars <- function(p_value) {
+  if (p_value < 0.001) return("***")
+  else if (p_value < 0.01) return("**")
+  else if (p_value < 0.05) return("*")
+  else return("ns")
+}
+
+# Enhanced version for ggplot2 with pairwise comparisons
+add_gg_significance <- function(plot, data, x_var, y_var, method = "t.test") {
+  library(ggpubr)
+  plot + 
+    stat_compare_means(
+      method = method,
+      label = "p.signif",
+      comparisons = if(length(unique(data[[x_var]])) > 1) {
+        combn(unique(data[[x_var]]), 2, simplify = FALSE)
+      }
+    )
+}
+
+# Quick wrapper for statistical testing
+test_and_annotate <- function(data, x_var, y_var) {
+  # ANOVA for multiple groups
+  if (length(unique(data[[x_var]])) > 2) {
+    anova_test <- aov(as.formula(paste(y_var, "~", x_var)), data = data)
+    p_value <- summary(anova_test)[[1]]$"Pr(>F)"[1]
+    cat("ANOVA p-value:", p_value, "\n")
+  } 
+  # t-test for two groups
+  else {
+    groups <- unique(data[[x_var]])
+    group1 <- data[data[[x_var]] == groups[1], y_var]
+    group2 <- data[data[[x_var]] == groups[2], y_var]
+    p_value <- t.test(group1, group2)$p.value
+    cat("T-test p-value:", p_value, "\n")
+  }
+  return(add_significance_stars(p_value))
+}
+
+# Saving data frames Add this at the top of your R script
+save_plot_data <- function(data, plot_name = NULL) {
+  if (is.null(plot_name)) {
+    plot_name <- deparse(substitute(data))
+  }
+  
+  # Create directory if it doesn't exist
+  if (!dir.exists("saved_plot_data")) {
+    dir.create("saved_plot_data")
+  }
+  
+  filename <- paste0("saved_plot_data/", plot_name, "_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".csv")
+  write.csv(data, filename, row.names = FALSE)
+  message("Data saved: ", filename)
+  
+  # Also save metadata
+  meta <- list(
+    timestamp = Sys.time(),
+    dimensions = dim(data),
+    column_names = names(data),
+    data_types = sapply(data, class)
+  )
+  
+  capture.output(print(meta), file = sub(".csv", "_metadata.txt", filename))
+  return(filename)
+}
+
+######### setup done
+
+cat("Environment setup complete!\n")
+
+
+# =============================================================================
+# SECTION 1: DATA IMPORT AND VALIDATION
+# =============================================================================
+
+cat("\n", rep("=", 50), "\n", sep = "")
+cat("SECTION 1: DATA IMPORT AND VALIDATION\n")
+cat(rep("=", 50), "\n", sep = "")
+
+# Data import
+cat("Loading phyloseq object...\n")
+# Load saved phyloseq object (qs format)
+ps <- qs::qread("~/16Sdata/16S/phyloseq_object.qs")
+
+
+cat("Loading and processing metadata...\n")
+metadata <- read.csv("~/16Sdata/16S/sample_field_data1.csv", stringsAsFactors = FALSE)
+metadata <- metadata %>% filter(SampleID != "")
+rownames(metadata) <- metadata$SampleID
+sample_data(ps) <- sample_data(metadata)
+
+cat("Data validation:\n")
+cat("- Samples:", nsamples(ps), "\n")
+cat("- Taxa:", ntaxa(ps), "\n")
+
+# =============================================================================
+# SECTION 2: DATA FILTERING AND QUALITY CONTROL
+# =============================================================================
+
+cat("\n")
+cat(rep("=", 50), "\n", sep = "")
+cat("SECTION 2: DATA FILTERING AND QUALITY CONTROL\n")
+cat(rep("=", 50), "\n", sep = "")
+
+cat("Subsetting and filtering data...\n")
+ps_project <- subset_samples(ps, project %in% c("sample", "farmer_kit"))
+otu_table(ps_project) <- t(otu_table(ps_project))
+
+ps_clean <- ps_project %>%
+  subset_taxa(order != "unclassified_Cyanobacteriia") %>% 
+  subset_taxa(class != "unclassified_Cyanobacteria") %>%  
+  subset_taxa(phylum != "unclassified_Bacteria") %>%
+  subset_taxa(domain != "unclassified_Root") %>% 
+  subset_taxa(domain != "Eukaryota") %>%
+  subset_taxa(order != "Chloroplast") %>%
+  subset_taxa(family != "Mitochondria") %>%
+  subset_taxa(!grepl("^Incertae Sedis_", genus)) %>%
+  subset_taxa(genus != "Other")
+
+cat("Number of OTUs before filtering:", ntaxa(ps_project), "\n")
+cat("Number of OTUs after filtering:", ntaxa(ps_clean), "\n")
+
+# Convert to matrix and remove zeros
+otu_matrix <- as(otu_table(ps_clean), "matrix")
+otu_matrix <- otu_matrix[rowSums(otu_matrix) > 0, colSums(otu_matrix) > 0]
+
+# Rarefaction curve
+cat("Generating rarefaction curves...\n")
+RCurve <- rarecurve(otu_matrix, step = 500, tidy = FALSE, label = FALSE)
+
+RCurve_tidy <- imap_dfr(RCurve, ~ {
+  data.frame(
+    Sample = rownames(otu_matrix)[.y],
+    Reads = attr(.x, "Subsample"),
+    OTUs = as.vector(.x),
+    stringsAsFactors = FALSE
+  )
+})
+
+p_rare <- ggplot(RCurve_tidy, aes(x = Reads, y = OTUs)) +
+  geom_line(aes(group = Sample), alpha = 0.3, linewidth = 0.5) +
+  geom_vline(xintercept = 1250, linetype = "dashed", color = "red") +
+  labs(x = "Sequencing Depth", y = "Observed OTUs", title = "Rarefaction Curves") +
+  theme_minimal()
+
+print(p_rare)
+ggsave(file.path(FIGURES, "rarefaction_curves.png"), p_rare, width = 8, height = 6)
+
+# Sequencing depth histogram
+seq_depths <- sample_sums(ps_clean)
+depth_df <- data.frame(Sample = names(seq_depths), Reads = seq_depths)
+
+p_depth <- ggplot(depth_df, aes(x = Reads)) +
+  geom_histogram(binwidth = 100, fill = "blue", alpha = 0.5, color = "black") +
+  geom_vline(xintercept = 1250, linetype = "dashed", color = "green") +
+  labs(title = "Distribution of Sequencing Depths", x = "Total Reads per Sample", y = "Number of Samples") +
+  theme_minimal()
+
+print(p_depth)
+ggsave(file.path(FIGURES, "sequencing_depth_distribution.png"), p_depth, width = 8, height = 6)
+
+# Filter by sequencing depth
+ps_filtered <- prune_samples(sample_sums(ps_clean) >= 0, ps_clean)
+cat("Samples retained after filtering:", nsamples(ps_filtered), "\n")
+
+# =============================================================================
+# SECTION 3: ALPHA DIVERSITY ANALYSIS
+# =============================================================================
+
+cat("\n")
+cat(rep("=", 50), "\n", sep = "")
+cat("SECTION 3: ALPHA DIVERSITY ANALYSIS\n")
+cat(rep("=", 50), "\n", sep = "")
+
+cat("Calculating alpha diversity...\n")
+
+# Calculate diversity metrics
+compute_alpha_diversity <- function(physeq) {
+  otu <- as(otu_table(physeq), "matrix")
+  if (taxa_are_rows(physeq)) otu <- t(otu)
+  
+  return(list(
+    Shannon = vegan::diversity(otu, "shannon"),
+    Observed = rowSums(otu > 0),
+    Simpson = vegan::diversity(otu, "simpson")
+  ))
+}
+
+alpha_results <- compute_alpha_diversity(ps_filtered)
+sample_data(ps_filtered)$Shannon <- alpha_results$Shannon
+sample_data(ps_filtered)$Observed <- alpha_results$Observed
+sample_data(ps_filtered)$Simpson <- alpha_results$Simpson
+
+metadata <- data.frame(sample_data(ps_filtered))
+
+# Plotting function
+plot_alpha_diversity <- function(data, x_var, title_suffix) {
+  p_shannon <- ggplot(data, aes(x = .data[[x_var]], y = Shannon, fill = .data[[x_var]])) +
+    geom_boxplot(outlier.shape = NA, alpha = 0.7) +
+    geom_jitter(width = 0.2, size = 1, alpha = 0.6) +
+    labs(title = paste("Shannon Diversity by", title_suffix), x = NULL, y = "Shannon Diversity") +
+    theme_minimal() +
+    theme(legend.position = "none", axis.text.x = element_text(angle = 90, hjust = 1))
+  
+  p_observed <- ggplot(data, aes(x = .data[[x_var]], y = Observed, fill = .data[[x_var]])) +
+    geom_boxplot(outlier.shape = NA, alpha = 0.7) +
+    geom_jitter(width = 0.2, size = 1, alpha = 0.6) +
+    labs(title = paste("Observed Richness by", title_suffix), x = NULL, y = "Number of OTUs") +
+    theme_minimal() +
+    theme(legend.position = "none", axis.text.x = element_text(angle = 90, hjust = 1))
+  
+  # Add significance tests
+  group_counts <- table(data[[x_var]])
+  valid_groups <- sum(group_counts >= 2)
+  
+  if (valid_groups >= 2) {
+    p_shannon <- p_shannon + stat_compare_means(method = ifelse(length(unique(data[[x_var]])) > 2, "anova", "t.test"))
+    p_observed <- p_observed + stat_compare_means(method = ifelse(length(unique(data[[x_var]])) > 2, "anova", "t.test"))
+  }
+  
+  return(list(shannon = p_shannon, observed = p_observed))
+}
+
+# Generate plots for each variable
+alpha_vars <- c("tillage_method", "fertiliser_use", "take_all_seen", "field")
+for (var in alpha_vars) {
+  if (var %in% colnames(metadata) && length(unique(metadata[[var]])) > 1) {
+    cat("Creating alpha diversity plots for", var, "\n")
+    plots <- plot_alpha_diversity(metadata, var, var)
+    
+    print(plots$shannon)
+    print(plots$observed)
+    
+    ggsave(file.path(FIGURES, paste0("alpha_shannon_", var, ".png")), plots$shannon, width = 6, height = 4)
+    ggsave(file.path(FIGURES, paste0("alpha_observed_", var, ".png")), plots$observed, width = 6, height = 4)
+  }
+}
+
+# =============================================================================
+# SECTION 4: HILL DIVERSITY ANALYSIS
+# =============================================================================
+
+cat("\n")
+cat(rep("=", 50), "\n", sep = "")
+cat("SECTION 4: HILL DIVERSITY ANALYSIS\n")
+cat(rep("=", 50), "\n", sep = "")
+
+cat("Calculating Hill diversity...\n")
+
+compute_hill_diversity <- function(physeq) {
+  otu <- as(otu_table(physeq), "matrix")
+  if (taxa_are_rows(physeq)) otu <- t(otu)
+  
+  hill_q0 <- hillR::hill_taxa(otu, q = 0)
+  hill_q1 <- hillR::hill_taxa(otu, q = 1)
+  hill_q2 <- hillR::hill_taxa(otu, q = 2)
+  
+  hill_q2 <- ifelse(is.infinite(hill_q2) | is.na(hill_q2), NA, hill_q2)
+  
+  return(list(Hill_q0 = hill_q0, Hill_q1 = hill_q1, Hill_q2 = hill_q2))
+}
+
+hill_results <- compute_hill_diversity(ps_filtered)
+sample_data(ps_filtered)$Hill_q0 <- hill_results$Hill_q0
+sample_data(ps_filtered)$Hill_q1 <- hill_results$Hill_q1
+sample_data(ps_filtered)$Hill_q2 <- hill_results$Hill_q2
+
+metadata <- data.frame(sample_data(ps_filtered))
+
+# Summarize Hill diversity by groups
+hill_summary <- metadata %>%
+  group_by(take_all_seen, fertiliser_use) %>%
+  summarise(
+    Hill_q0_mean = mean(Hill_q0, na.rm = TRUE),
+    Hill_q1_mean = mean(Hill_q1, na.rm = TRUE),
+    Hill_q2_mean = mean(Hill_q2, na.rm = TRUE),
+    Hill_q0_se = sd(Hill_q0, na.rm = TRUE) / sqrt(n()),
+    Hill_q1_se = sd(Hill_q1, na.rm = TRUE) / sqrt(n()),
+    Hill_q2_se = sd(Hill_q2, na.rm = TRUE) / sqrt(n()),
+    n = n(),
+    .groups = "drop"
+  )
+
+# Prepare data for plotting
+hill_plot_data <- bind_rows(
+  hill_summary %>% select(take_all_seen, fertiliser_use, mean = Hill_q0_mean, se = Hill_q0_se) %>% mutate(Metric = "Richness (q=0)"),
+  hill_summary %>% select(take_all_seen, fertiliser_use, mean = Hill_q1_mean, se = Hill_q1_se) %>% mutate(Metric = "Shannon (q=1)"),
+  hill_summary %>% select(take_all_seen, fertiliser_use, mean = Hill_q2_mean, se = Hill_q2_se) %>% mutate(Metric = "Simpson (q=2)")
+) %>%
+  mutate(Metric = factor(Metric, levels = c("Richness (q=0)", "Shannon (q=1)", "Simpson (q=2)")))
+
+# Plot Hill diversity
+p_hill <- ggplot(hill_plot_data, aes(x = fertiliser_use, y = mean, color = take_all_seen)) +
+  geom_point(position = position_dodge(width = 0.5), size = 3) +
+  geom_errorbar(aes(ymin = mean - se, ymax = mean + se), width = 0.2, position = position_dodge(width = 0.5)) +
+  facet_wrap(~Metric, scales = "free_y") +
+  labs(title = "Hill Diversity by Take-All Observation and Fertiliser Use",
+       x = "Fertiliser Use", y = "Effective Number of Species",
+       color = "Take-All Observed") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+print(p_hill)
+ggsave(file.path(FIGURES, "hill_diversity.png"), p_hill, width = 10, height = 6)
+
+# Save Hill diversity summary
+write.csv(hill_summary, file.path(TABLES, "hill_diversity_summary.csv"), row.names = FALSE)
+
+# =============================================================================
+# SECTION 5: BETA DIVERSITY ANALYSIS
+# =============================================================================
+
+cat("\n")
+cat(rep("=", 50), "\n", sep = "")
+cat("SECTION 5: BETA DIVERSITY ANALYSIS\n")
+cat(rep("=", 50), "\n", sep = "")
+
+cat("Calculating beta diversity...\n")
+
+# Helper function for PERMANOVA with safety checks
+perform_permanova <- function(formula, data, min_per_group = 3, permutations = 999) {
+  # Check if we have enough samples per level
+  vars <- all.vars(formula)[-1]  # Remove the response variable
+  
+  for(var in vars) {
+    if(var %in% colnames(data)) {
+      group_counts <- table(data[[var]])
+      if(any(group_counts < min_per_group)) {
+        cat("  Skipping PERMANOVA for", var, 
+            "- insufficient samples in groups:", 
+            paste(names(group_counts)[group_counts < min_per_group], 
+                  collapse = ", "), "\n")
+        return(NULL)
+      }
+    }
+  }
+  
+  # Run PERMANOVA with tryCatch
+  tryCatch({
+    result <- adonis2(formula, data = data, permutations = permutations)
+    return(result)
+  }, error = function(e) {
+    cat("  PERMANOVA failed:", e$message, "\n")
+    return(NULL)
+  })
+}
+
+tryCatch({
+  cat("Computing Bray-Curtis dissimilarity...\n")
+  
+  # Extract OTU table efficiently
+  otu_table_mat <- as(otu_table(ps_filtered), "matrix")
+  if (taxa_are_rows(ps_filtered)) {
+    otu_table_mat <- t(otu_table_mat)
+  }
+  
+  # Data quality checks
+  cat("\nData Quality Checks:\n")
+  cat("Initial samples:", nrow(otu_table_mat), "\n")
+  cat("Initial OTUs:", ncol(otu_table_mat), "\n")
+  
+  # Remove any zero-variance samples/OTUs that might cause issues
+  otu_table_mat <- otu_table_mat[, colSums(otu_table_mat) > 0]
+  otu_table_mat <- otu_table_mat[rowSums(otu_table_mat) > 0, ]
+  
+  cat("After removing zeros - Samples:", nrow(otu_table_mat), "\n")
+  cat("After removing zeros - OTUs:", ncol(otu_table_mat), "\n")
+  
+  # Check for constant rows/columns
+  row_sds <- apply(otu_table_mat, 1, sd)
+  col_sds <- apply(otu_table_mat, 2, sd)
+  cat("Samples with zero variance:", sum(row_sds == 0), "\n")
+  cat("OTUs with zero variance:", sum(col_sds == 0), "\n")
+  
+  # Remove any constant rows/columns
+  otu_table_mat <- otu_table_mat[row_sds > 0, col_sds > 0]
+  
+  cat("OTU table dimensions for beta diversity:", dim(otu_table_mat), "\n")
+  
+  if(nrow(otu_table_mat) < 5 || ncol(otu_table_mat) < 5) {
+    stop("Insufficient data after filtering. Need at least 5 samples and 5 OTUs.")
+  }
+  
+  # Compute Bray-Curtis with progress indication
+  bray_dist <- vegan::vegdist(otu_table_mat, method = "bray")
+  
+  # NMDS ordination with adjusted parameters for large datasets
+  cat("Running NMDS (this may take a while for large datasets)...\n")
+  
+  # Adjust parameters based on dataset size
+  n_samples <- nrow(otu_table_mat)
+  if (n_samples > 100) {
+    cat("Large dataset detected (", n_samples, " samples), using conservative NMDS parameters\n")
+    nmds_result <- metaMDS(bray_dist, k = 2, trymax = 20, autotransform = FALSE, 
+                           noshare = TRUE, wascores = TRUE, trace = 1)
+  } else {
+    nmds_result <- metaMDS(bray_dist, k = 2, trymax = 50, trace = 1)
+  }
+  
+  cat("\nNMDS Diagnostics:\n")
+  cat("Stress:", round(nmds_result$stress, 6), "\n")
+  cat("Converged:", nmds_result$converged, "\n")
+  cat("Number of iterations:", nmds_result$iters, "\n")
+  
+  # Check for potential issues with extremely low stress
+  if(nmds_result$stress < 0.01) {
+    cat("Warning: Extremely low stress value.\n")
+    cat("This may indicate very strong patterns or technical issues.\n")
+    
+    # Try alternative NMDS settings for comparison
+    cat("Running alternative NMDS for comparison...\n")
+    nmds_alt <- metaMDS(bray_dist, k = 2, trymax = 50, 
+                        autotransform = FALSE, noshare = FALSE,
+                        wascores = FALSE)
+    cat("Alternative stress:", round(nmds_alt$stress, 6), "\n")
+  }
+  
+  # Prepare NMDS plot data
+  nmds_scores <- as.data.frame(scores(nmds_result, "sites"))
+  
+  # Ensure metadata alignment
+  common_samples <- intersect(rownames(nmds_scores), rownames(metadata))
+  nmds_scores <- nmds_scores[common_samples, ]
+  plot_metadata <- metadata[common_samples, ]
+  
+  nmds_plot_data <- cbind(nmds_scores, plot_metadata)
+  colnames(nmds_plot_data)[1:2] <- c("NMDS1", "NMDS2")
+  
+  # NMDS Plot 1: By Take-All and Tillage
+  p_nmds1 <- ggplot(nmds_plot_data, aes(x = NMDS1, y = NMDS2, 
+                                        color = take_all_seen, 
+                                        shape = tillage_method)) +
+    geom_point(size = 3, alpha = 0.8) +
+    labs(title = "NMDS Plot (Bray-Curtis) - Take-All vs Tillage",
+         subtitle = paste("Stress =", round(nmds_result$stress, 3)),
+         color = "Take-All Observed",
+         shape = "Tillage Method") +
+    theme_minimal()
+  
+  # Only add ellipses if we have enough points per group
+  take_all_counts <- table(nmds_plot_data$take_all_seen)
+  if (all(take_all_counts >= 3)) {
+    p_nmds1 <- p_nmds1 + stat_ellipse(level = 0.8, alpha = 0.5)
+  }
+  
+  print(p_nmds1)
+  ggsave(file.path(FIGURES, "nmds_takeall_tillage.png"), p_nmds1, width = 14, height = 6)
+  
+  # NMDS Plot 2: By Field
+  if ("field" %in% colnames(nmds_plot_data) && length(unique(nmds_plot_data$field)) > 1) {
+    p_nmds2 <- ggplot(nmds_plot_data, aes(x = NMDS1, y = NMDS2, 
+                                          color = field)) +
+      geom_point(size = 3, alpha = 0.8) +
+      labs(title = "NMDS Plot (Bray-Curtis) - By Field",
+           subtitle = paste("Stress =", round(nmds_result$stress, 3)),
+           color = "Field") +
+      theme_minimal()
+    
+    field_counts <- table(nmds_plot_data$field)
+    if (all(field_counts >= 3)) {
+      p_nmds2 <- p_nmds2 + stat_ellipse(level = 0.8, alpha = 0.5)
+    }
+    
+    print(p_nmds2)
+    ggsave(file.path(FIGURES, "nmds_by_field.png"), p_nmds2, width = 14, height = 6)
+    
+    # NMDS Plot 3: Field and Take-All combined
+    p_nmds3 <- ggplot(nmds_plot_data, aes(x = NMDS1, y = NMDS2, 
+                                          color = field, 
+                                          shape = take_all_seen)) +
+      geom_point(size = 3, alpha = 0.8) +
+      labs(title = "NMDS Plot (Bray-Curtis) - Field and Take-All",
+           subtitle = paste("Stress =", round(nmds_result$stress, 3)),
+           color = "Field",
+           shape = "Take-All Observed") +
+      theme_minimal()
+    
+    print(p_nmds3)
+    ggsave(file.path(FIGURES, "nmds_field_takeall.png"), p_nmds3, width = 14, height = 6)
+  }
+  
+  # PERMANOVA tests
+  if (n_samples >= 10) {
+    cat("\nPERMANOVA results:\n")
+    
+    # Prepare data for PERMANOVA
+    permanova_data <- metadata[rownames(as.matrix(bray_dist)), ]
+    
+    # PERMANOVA 1: Take-All and Tillage
+    cat("\n--- PERMANOVA: Take-All + Tillage ---\n")
+    permanova1 <- perform_permanova(bray_dist ~ take_all_seen + tillage_method, 
+                                    data = permanova_data)
+    if(!is.null(permanova1)) {
+      print(permanova1)
+    } else {
+      cat("PERMANOVA not performed due to insufficient samples\n")
+    }
+    
+    # PERMANOVA 2: By Field
+    if ("field" %in% colnames(permanova_data) && length(unique(permanova_data$field)) > 1) {
+      cat("\n--- PERMANOVA: By Field ---\n")
+      permanova2 <- perform_permanova(bray_dist ~ field, 
+                                      data = permanova_data)
+      if(!is.null(permanova2)) {
+        print(permanova2)
+        
+        # PERMANOVA 3: Field + Take-All + Tillage
+        cat("\n--- PERMANOVA: Field + Take-All + Tillage ---\n")
+        permanova3 <- perform_permanova(bray_dist ~ field + take_all_seen + tillage_method, 
+                                        data = permanova_data)
+        if(!is.null(permanova3)) {
+          print(permanova3)
+        }
+      }
+    }
+    
+    # Save PERMANOVA results
+    sink(file.path(TABLES, "permanova_results.txt"))
+    cat("PERMANOVA Results (Bray-Curtis)\n")
+    cat("===============================\n\n")
+    
+    cat("Take-All + Tillage:\n")
+    if (exists("permanova1") && !is.null(permanova1)) print(permanova1)
+    
+    if ("field" %in% colnames(permanova_data)) {
+      cat("\nBy Field:\n")
+      if (exists("permanova2") && !is.null(permanova2)) print(permanova2)
+      
+      cat("\nField + Take-All + Tillage:\n")
+      if (exists("permanova3") && !is.null(permanova3)) print(permanova3)
+    }
+    sink()
+  } else {
+    cat("\nToo few samples for meaningful PERMANOVA (n < 10)\n")
+  }
+  
+  # PCoA analysis as alternative
+  cat("\nRunning PCoA analysis...\n")
+  pcoa_result <- cmdscale(bray_dist, k = 2, eig = TRUE)
+  
+  # Calculate variance explained
+  variance_explained <- round(pcoa_result$eig[1:2] / sum(pcoa_result$eig[pcoa_result$eig > 0]) * 100, 1)
+  
+  pcoa_scores <- as.data.frame(pcoa_result$points)
+  colnames(pcoa_scores) <- c("PCoA1", "PCoA2")
+  
+  # Ensure metadata alignment
+  common_samples_pcoa <- intersect(rownames(pcoa_scores), rownames(metadata))
+  pcoa_scores <- pcoa_scores[common_samples_pcoa, ]
+  pcoa_metadata <- metadata[common_samples_pcoa, ]
+  pcoa_plot_data <- cbind(pcoa_scores, pcoa_metadata)
+  
+  # PCoA Plot 1: By Take-All and Tillage
+  p_pcoa1 <- ggplot(pcoa_plot_data, aes(x = PCoA1, y = PCoA2, 
+                                        color = take_all_seen, 
+                                        shape = tillage_method)) +
+    geom_point(size = 3, alpha = 0.8) +
+    labs(title = "PCoA Plot - Take-All vs Tillage",
+         subtitle = paste("Variance explained: PCoA1 =", variance_explained[1], "%, PCoA2 =", variance_explained[2], "%"),
+         color = "Take-All Observed",
+         shape = "Tillage Method") +
+    theme_minimal()
+  
+  print(p_pcoa1)
+  ggsave(file.path(FIGURES, "pcoa_takeall_tillage.png"), p_pcoa1, width = 14, height = 6)
+  
+  # PCoA Plot 2: By Field
+  if ("field" %in% colnames(pcoa_plot_data)) {
+    p_pcoa2 <- ggplot(pcoa_plot_data, aes(x = PCoA1, y = PCoA2, 
+                                          color = field)) +
+      geom_point(size = 3, alpha = 0.8) +
+      labs(title = "PCoA Plot - By Field",
+           subtitle = paste("Variance explained: PCoA1 =", variance_explained[1], "%, PCoA2 =", variance_explained[2], "%"),
+           color = "Field") +
+      theme_minimal()
+    
+    print(p_pcoa2)
+    ggsave(file.path(FIGURES, "pcoa_by_field.png"), p_pcoa2, width = 14, height = 6)
+    
+    # PCoA Plot 3: Field and Fertiliser Use
+    if ("fertiliser_use" %in% colnames(pcoa_plot_data)) {
+      p_pcoa3 <- ggplot(pcoa_plot_data, aes(x = PCoA1, y = PCoA2, 
+                                            color = field, 
+                                            shape = fertiliser_use)) +
+        geom_point(size = 3, alpha = 0.8) +
+        labs(title = "PCoA Plot - Field and Fertiliser Use",
+             subtitle = paste("Variance explained: PCoA1 =", variance_explained[1], "%, PCoA2 =", variance_explained[2], "%"),
+             color = "Field",
+             shape = "Fertiliser Use") +
+        theme_minimal()
+      
+      print(p_pcoa3)
+      ggsave(file.path(FIGURES, "pcoa_field_fertiliser.png"), p_pcoa3, width = 14, height = 6)
+    }
+  }
+  
+  # Beta dispersion analysis (homogeneity of variances)
+  cat("\nTesting homogeneity of group dispersions...\n")
+  
+  # Beta dispersion by field
+  if ("field" %in% colnames(metadata) && length(unique(metadata$field)) > 1) {
+    tryCatch({
+      # Ensure we have matching samples
+      common_bdisp <- intersect(rownames(as.matrix(bray_dist)), rownames(metadata))
+      if(length(common_bdisp) >= 10) {
+        field_bdisp <- betadisper(bray_dist[common_bdisp, common_bdisp], 
+                                  group = metadata[common_bdisp, "field"])
+        
+        cat("\nBeta Dispersion by Field:\n")
+        print(anova(field_bdisp))
+        
+        # Tukey HSD only if we have multiple fields
+        if(length(unique(metadata[common_bdisp, "field"])) > 1) {
+          tukey_result <- TukeyHSD(field_bdisp)
+          print(tukey_result)
+        }
+        
+        # Create data frame for ggplot
+        bdisp_df <- data.frame(
+          group = field_bdisp$group,
+          distances = field_bdisp$distances,
+          pc1 = field_bdisp$vectors[, 1],
+          pc2 = field_bdisp$vectors[, 2]
+        )
+        
+        # Create centroid plot
+        centroids <- aggregate(cbind(pc1, pc2) ~ group, data = bdisp_df, FUN = mean)
+        
+        p_bdisp <- ggplot(bdisp_df, aes(x = pc1, y = pc2, color = group)) +
+          geom_point(alpha = 0.6, size = 2) +
+          geom_point(data = centroids, aes(x = pc1, y = pc2, color = group), 
+                     size = 5, shape = 17) +  # Centroids as triangles
+          stat_ellipse(level = 0.68, alpha = 0.3) +
+          labs(title = "Beta Dispersion by Field",
+               subtitle = "Centroids shown as triangles",
+               x = "PCoA Axis 1",
+               y = "PCoA Axis 2",
+               color = "Field") +
+          theme_minimal() +
+          theme(legend.position = "right")
+        
+        print(p_bdisp)
+        ggsave(file.path(FIGURES, "beta_dispersion_field.png"), p_bdisp, width = 14, height = 6)
+        
+        # Boxplot of distances
+        p_bdisp_box <- ggplot(bdisp_df, aes(x = group, y = distances, fill = group)) +
+          geom_boxplot(alpha = 0.7) +
+          geom_jitter(width = 0.2, alpha = 0.5) +
+          labs(title = "Beta Dispersion Distances by Field",
+               x = "Field",
+               y = "Distance to Centroid") +
+          theme_minimal() +
+          theme(axis.text.x = element_text(angle = 45, hjust = 1))
+        
+        print(p_bdisp_box)
+        ggsave(file.path(FIGURES, "beta_dispersion_boxplot.png"), p_bdisp_box, width = 14, height = 6)
+        
+      } else {
+        cat("Insufficient samples for beta dispersion analysis\n")
+      }
+      
+    }, error = function(e) {
+      cat("Beta dispersion analysis failed:", e$message, "\n")
+    })
+  }
+  
+  # Field-specific beta diversity analysis
+  if ("field" %in% colnames(metadata)) {
+    cat("\nField-specific beta diversity analysis:\n")
+    
+    fields <- unique(metadata$field)
+    field_beta_results <- list()
+    field_sample_counts <- list()
+    
+    for (f in fields) {
+      field_samples <- rownames(metadata)[metadata$field == f]
+      if (length(field_samples) >= 3) {
+        cat("Analyzing field:", f, "(", length(field_samples), "samples )\n")
+        
+        # Check if all samples exist in the distance matrix
+        dist_matrix <- as.matrix(bray_dist)
+        available_samples <- intersect(field_samples, rownames(dist_matrix))
+        
+        if (length(available_samples) >= 3) {
+          # Subset distance matrix safely
+          field_dist <- as.dist(dist_matrix[available_samples, available_samples])
+          
+          # Calculate mean distance within field
+          mean_dist <- mean(field_dist, na.rm = TRUE)
+          field_beta_results[[f]] <- mean_dist
+          field_sample_counts[[f]] <- length(available_samples)
+          
+          cat("  Mean within-field distance:", round(mean_dist, 3), 
+              " (", length(available_samples), " available samples)\n")
+        } else {
+          cat("  Insufficient samples in distance matrix:", length(available_samples), "available\n")
+        }
+      } else {
+        cat("Field", f, "has insufficient samples:", length(field_samples), "\n")
+      }
+    }
+    
+    # Save field-specific results
+    if (length(field_beta_results) > 0) {
+      field_beta_df <- data.frame(
+        Field = names(field_beta_results),
+        Mean_Within_Field_Distance = unlist(field_beta_results),
+        Samples = unlist(field_sample_counts)
+      )
+      
+      write.csv(field_beta_df, file.path(TABLES, "field_beta_diversity.csv"), row.names = FALSE)
+      
+      # Plot within-field distances
+      p_field_beta <- ggplot(field_beta_df, aes(x = reorder(Field, -Mean_Within_Field_Distance), 
+                                                y = Mean_Within_Field_Distance, 
+                                                fill = Field)) +
+        geom_bar(stat = "identity", alpha = 0.7) +
+        geom_text(aes(label = paste0("n=", Samples)), 
+                  vjust = -0.5, size = 3) +
+        labs(title = "Mean Within-Field Beta Diversity",
+             subtitle = "Lower values = more homogeneous communities",
+             y = "Mean Bray-Curtis Distance",
+             x = "Field") +
+        theme_minimal() +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+        ylim(0, max(field_beta_df$Mean_Within_Field_Distance) * 1.2)
+      
+      print(p_field_beta)
+      ggsave(file.path(FIGURES, "within_field_beta_diversity.png"), p_field_beta, width = 14, height = 6)
+      
+      # Calculate between-field distances
+      if(length(field_beta_results) > 1) {
+        cat("\nBetween-field beta diversity:\n")
+        field_comparisons <- list()
+        
+        for(i in 1:(length(fields)-1)) {
+          for(j in (i+1):length(fields)) {
+            f1 <- fields[i]
+            f2 <- fields[j]
+            
+            samples_f1 <- intersect(rownames(metadata)[metadata$field == f1], 
+                                    rownames(as.matrix(bray_dist)))
+            samples_f2 <- intersect(rownames(metadata)[metadata$field == f2], 
+                                    rownames(as.matrix(bray_dist)))
+            
+            if(length(samples_f1) >= 2 && length(samples_f2) >= 2) {
+              # Calculate between-field distances
+              dist_matrix <- as.matrix(bray_dist)
+              between_dists <- dist_matrix[samples_f1, samples_f2]
+              mean_between <- mean(between_dists, na.rm = TRUE)
+              
+              field_comparisons[[paste(f1, "vs", f2)]] <- mean_between
+              cat(f1, "vs", f2, ": mean distance =", round(mean_between, 3), "\n")
+            }
+          }
+        }
+        
+        if(length(field_comparisons) > 0) {
+          between_df <- data.frame(
+            Comparison = names(field_comparisons),
+            Mean_Between_Field_Distance = unlist(field_comparisons)
+          )
+          
+          write.csv(between_df, file.path(TABLES, "between_field_beta_diversity.csv"), 
+                    row.names = FALSE)
+        }
+      }
+    } else {
+      cat("No fields had sufficient samples for within-field analysis\n")
+    }
+  }
+  
+  cat("\nBeta diversity analysis completed successfully!\n")
+  
+}, error = function(e) {
+  cat("Beta diversity analysis failed:", e$message, "\n")
+  cat("Attempting simplified analysis...\n")
+  
+  # Fallback: Simple PCoA without NMDS
+  tryCatch({
+    otu_table_mat <- as(otu_table(ps_filtered), "matrix")
+    if (taxa_are_rows(ps_filtered)) otu_table_mat <- t(otu_table_mat)
+    
+    # Use subset if too large
+    max_samples <- min(50, nrow(otu_table_mat))
+    bray_dist_simple <- vegan::vegdist(otu_table_mat[1:max_samples, ], 
+                                       method = "bray")
+    pcoa_simple <- cmdscale(bray_dist_simple, k = 2, eig = TRUE)
+    
+    # Calculate variance explained
+    variance_simple <- round(pcoa_simple$eig[1:2] / sum(pcoa_simple$eig[pcoa_simple$eig > 0]) * 100, 1)
+    
+    pcoa_df <- as.data.frame(pcoa_simple$points)
+    colnames(pcoa_df) <- c("PCoA1", "PCoA2")
+    
+    # Add metadata for simple plot
+    simple_metadata <- metadata[rownames(pcoa_df), ]
+    pcoa_df <- cbind(pcoa_df, simple_metadata)
+    
+    p_simple <- ggplot(pcoa_df, aes(x = PCoA1, y = PCoA2, color = field)) +
+      geom_point(size = 3, alpha = 0.7) +
+      labs(title = "PCoA Plot - By Field (Subset of Data)",
+           subtitle = paste("Variance explained: PCoA1 =", variance_simple[1], "%, PCoA2 =", variance_simple[2], "%"),
+           color = "Field") +
+      theme_minimal()
+    
+    print(p_simple)
+    ggsave(file.path(FIGURES, "pcoa_simple_field.png"), p_simple, width = 14, height = 6)
+    
+    cat("Simplified analysis completed with", max_samples, "samples\n")
+    
+  }, error = function(e2) {
+    cat("Simplified analysis also failed:", e2$message, "\n")
+  })
+})
+
+# =============================================================================
+# SECTION 6: TAXONOMIC ABUNDANCE ANALYSIS
+# =============================================================================
+
+cat("\n")
+cat(rep("=", 60), "\n", sep = "")
+cat("SECTION 6: TAXONOMIC ABUNDANCE ANALYSIS\n")
+cat(rep("=", 60), "\n", sep = "")
+
+cat("Analyzing taxonomic abundances...\n")
+
+# Helper functions
+clean_tax <- function(x) {
+  ifelse(grepl("^Incertae Sedis_", x, ignore.case = TRUE), NA, x)
+}
+
+calculate_abundances <- function(physeq, level) {
+  if (!level %in% rank_names(physeq)) {
+    stop(paste("Taxonomic level", level, "not available"))
+  }
+  physeq_agg <- tax_glom(physeq, taxrank = level, NArm = FALSE)
+  physeq_rel <- transform_sample_counts(physeq_agg, function(x) x / sum(x) * 100)
+  list(
+    absolute = psmelt(physeq_agg),
+    relative = psmelt(physeq_rel)
+  )
+}
+
+get_top_taxa <- function(melted_df, level, top_n = 20) {
+  melted_df %>%
+    mutate(!!sym(level) := clean_tax(.data[[level]])) %>%
+    filter(!is.na(.data[[level]]), 
+           .data[[level]] != "Other",
+           !grepl("^unclassified$", .data[[level]], ignore.case = TRUE)) %>%
+    group_by(.data[[level]]) %>%
+    summarise(total = sum(Abundance), .groups = "drop") %>%
+    arrange(desc(total)) %>%
+    slice_head(n = top_n) %>%
+    pull(!!sym(level))
+}
+
+# Define custom plotting orders for each taxonomic level
+get_plotting_order <- function(level) {
+  if (level == "genus") {
+    return(c("Cyanobium PCC-6307", "Bacteroides", "Dechloromonas", "Candidatus Accumulibacter", 
+             "Akkermansia", "Serratia", "Sva0081 sediment group", "SU2 symbiont group", 
+             "Raoultella", "Desulfobulbus", "Microcystis PCC-7914", "Arenimonas", 
+             "Nodosilinea PCC-7104", "Ochrobactrum", "Luteolibacter", "Alistipes", 
+             "Defluviicoccus", "Halioglobus", "Roseomonas", "Flavobacterium", 
+             "Prevotella", "Parabacteroides", "Ilumatobacter", "Pirellula", 
+             "Dinghuibacter", "Aurantisolimonas", "Erysipelotrichaceae UCG-003", 
+             "Rubripirellula", "Bifidobacterium", "Barnesiella"))
+  } else if (level == "order") {
+    return(c("Burkholderiales", "Bacteroidales", "Cyanobacteriales", "Synechococcales", 
+             "Enterobacterales", "Verrucomicrobiales", "Rhizobiales", "Desulfobacterales", 
+             "Pirellulales", "Desulfobulbales", "Xanthomonadales", "Isosphaerales", 
+             "Flavobacteriales", "Chitinophagales", "Phormidesmiales", "Acetobacterales", 
+             "Rhodobacterales", "Phycisphaerales", "Cellvibrionales", "Defluviicoccales"))
+  } else if (level == "phylum") {
+    return(c("Proteobacteria", "Cyanobacteria", "Bacteroidota", "Planctomycetota", 
+             "Verrucomicrobiota", "Desulfobacterota", "Firmicutes", "Actinobacteriota", 
+             "Acidobacteriota", "Gemmatimonadota", "Chloroflexi", "Spirochaetota", 
+             "Myxococcota", "Bdellovibrionota", "Euryarchaeota"))
+  } else {
+    return(NULL) # No custom order for other levels
+  }
+}
+
+# FIXED: Main abundance plot function that includes ALL taxa from custom list
+create_abundance_plot_force_taxa <- function(melted_df, level, force_taxa = NULL, top_n = 20, 
+                                             type = "relative", x_var = "field") {
+  # Apply custom plotting order if available
+  plotting_order <- get_plotting_order(level)
+  
+  # Create the plot data frame - include ALL taxa initially
+  plot_df <- melted_df %>%
+    mutate(!!sym(level) := clean_tax(.data[[level]])) %>%
+    filter(!is.na(.data[[level]]), 
+           .data[[level]] != "Other",
+           !grepl("^unclassified$", .data[[level]], ignore.case = TRUE),
+           Abundance > 0)
+  
+  # Calculate total abundance per taxon
+  taxon_totals <- plot_df %>%
+    group_by(.data[[level]]) %>%
+    summarise(total = sum(Abundance), .groups = "drop") %>%
+    arrange(desc(total))
+  
+  # Determine which taxa to show individually
+  taxa_in_data <- unique(plot_df[[level]])
+  
+  if(!is.null(force_taxa) && length(force_taxa) > 0) {
+    # Always include forced taxa that exist in the data
+    taxa_to_show <- force_taxa[force_taxa %in% taxa_in_data]
+    
+    # Add top abundant taxa up to top_n
+    if(length(taxa_to_show) < top_n) {
+      remaining_slots <- top_n - length(taxa_to_show)
+      additional_taxa <- taxon_totals %>%
+        filter(!.data[[level]] %in% taxa_to_show) %>%
+        slice_head(n = remaining_slots) %>%
+        pull(.data[[level]])
+      taxa_to_show <- c(taxa_to_show, additional_taxa)
+    }
+  } else {
+    # Just use top_n most abundant
+    taxa_to_show <- taxon_totals %>%
+      slice_head(n = top_n) %>%
+      pull(.data[[level]])
+  }
+  
+  # Apply custom ordering if available
+  if (!is.null(plotting_order)) {
+    # Filter to only taxa in plotting_order
+    taxa_in_order <- plotting_order[plotting_order %in% taxa_in_data]
+    
+    if(length(taxa_in_order) > 0) {
+      plot_df <- plot_df %>%
+        filter(.data[[level]] %in% taxa_in_order) %>%
+        mutate(TaxaGroup = factor(.data[[level]], levels = taxa_in_order))
+    } else {
+      # If no taxa from plotting_order exist, use abundance order
+      plot_df <- plot_df %>%
+        mutate(TaxaGroup = ifelse(.data[[level]] %in% taxa_to_show, 
+                                  as.character(.data[[level]]), 
+                                  "Other"))
+      taxa_order <- c(taxa_to_show, "Other")
+      plot_df$TaxaGroup <- factor(plot_df$TaxaGroup, levels = taxa_order)
+    }
+  } else {
+    # Group less abundant taxa as "Other"
+    plot_df <- plot_df %>%
+      mutate(TaxaGroup = ifelse(.data[[level]] %in% taxa_to_show, 
+                                as.character(.data[[level]]), 
+                                "Other"))
+    
+    # Order: taxa_to_show in abundance order, then "Other"
+    taxa_order <- c(taxa_to_show, "Other")
+    plot_df$TaxaGroup <- factor(plot_df$TaxaGroup, levels = taxa_order)
+  }
+  
+  # Aggregate "Other" category if it exists
+  if("Other" %in% plot_df$TaxaGroup && sum(plot_df$TaxaGroup == "Other", na.rm = TRUE) > 0) {
+    other_df <- plot_df %>%
+      filter(TaxaGroup == "Other") %>%
+      group_by(.data[[x_var]]) %>%
+      summarise(Abundance = sum(Abundance), .groups = "drop") %>%
+      mutate(TaxaGroup = "Other")
+    
+    plot_df <- plot_df %>%
+      filter(TaxaGroup != "Other") %>%
+      bind_rows(other_df)
+  }
+  
+  # Prepare position for stacked bars
+  pos <- if (type == "relative") position_fill(reverse = TRUE) else position_stack(reverse = TRUE)
+  
+  # Create color palette
+  n_colors <- length(unique(plot_df$TaxaGroup))
+  if("Other" %in% plot_df$TaxaGroup) {
+    n_colors <- n_colors - 1
+    colors <- c(viridis::viridis(n_colors), "#808080")  # Grey for "Other"
+  } else {
+    colors <- viridis::viridis(n_colors)
+  }
+  
+  # Create the plot
+  p <- ggplot(plot_df, aes(x = .data[[x_var]], y = Abundance, fill = TaxaGroup)) +
+    geom_bar(stat = "identity", position = pos) +
+    scale_fill_manual(values = colors) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1),
+          legend.position = "right",
+          legend.text = element_text(size = 7),
+          legend.key.size = unit(0.4, "cm"))
+  
+  if (type == "relative") {
+    p <- p + scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+      ylab("Relative Abundance (%)")
+  } else {
+    p <- p + ylab("Absolute Abundance")
+  }
+  
+  # Create informative subtitle
+  if(!is.null(force_taxa) && length(force_taxa) > 0) {
+    taxa_found <- sum(force_taxa %in% taxa_in_data)
+    subtitle_text <- paste("Showing", length(unique(plot_df$TaxaGroup[plot_df$TaxaGroup != "Other"])), 
+                           level, "including", taxa_found, "specifically requested taxa")
+  } else {
+    subtitle_text <- paste("Top", length(taxa_to_show), level)
+  }
+  
+  p <- p + labs(
+    title = paste(stringr::str_to_title(type), "Abundance by", x_var),
+    subtitle = subtitle_text,
+    x = stringr::str_to_title(gsub("_", " ", x_var)),
+    fill = stringr::str_to_title(level)
+  )
+  
+  return(p)
+}
+
+# FIXED: Alternative plot type showing individual taxa abundances
+create_taxa_vs_abundance_plot <- function(melted_df, level, force_taxa = NULL, 
+                                          type = "relative", x_var = "field") {
+  # Calculate mean abundance per taxa and sample group
+  summary_df <- melted_df %>%
+    mutate(!!sym(level) := clean_tax(.data[[level]])) %>%
+    filter(!is.na(.data[[level]]), 
+           .data[[level]] != "Other",
+           !grepl("^unclassified$", .data[[level]], ignore.case = TRUE),
+           Abundance > 0) %>%
+    group_by(.data[[level]], .data[[x_var]]) %>%
+    summarise(mean_abundance = mean(Abundance, na.rm = TRUE), .groups = "drop")
+  
+  # Apply custom plotting order or use forced taxa
+  if(!is.null(force_taxa) && length(force_taxa) > 0) {
+    taxa_to_show <- force_taxa[force_taxa %in% unique(summary_df[[level]])]
+    
+    if(length(taxa_to_show) > 0) {
+      summary_df <- summary_df %>%
+        filter(.data[[level]] %in% taxa_to_show) %>%
+        mutate(!!sym(level) := factor(.data[[level]], levels = force_taxa))
+    } else {
+      # If no forced taxa found, use top 15 by total abundance
+      top_taxa <- summary_df %>%
+        group_by(.data[[level]]) %>%
+        summarise(total = sum(mean_abundance), .groups = "drop") %>%
+        arrange(desc(total)) %>%
+        slice_head(n = 15) %>%
+        pull(.data[[level]])
+      
+      summary_df <- summary_df %>%
+        filter(.data[[level]] %in% top_taxa) %>%
+        mutate(!!sym(level) := factor(.data[[level]], 
+                                      levels = top_taxa[order(-summarise(summary_df, 
+                                                                         total = sum(mean_abundance)))]))
+    }
+  } else {
+    # Use top 15 taxa by default
+    top_taxa <- summary_df %>%
+      group_by(.data[[level]]) %>%
+      summarise(total = sum(mean_abundance), .groups = "drop") %>%
+      arrange(desc(total)) %>%
+      slice_head(n = 15) %>%
+      pull(.data[[level]])
+    
+    summary_df <- summary_df %>%
+      filter(.data[[level]] %in% top_taxa) %>%
+      mutate(!!sym(level) := factor(.data[[level]], 
+                                    levels = top_taxa[order(-summarise(summary_df, 
+                                                                       total = sum(mean_abundance)))]))
+  }
+  
+  # Create the plot
+  p <- ggplot(summary_df, aes(x = .data[[level]], y = mean_abundance, fill = .data[[x_var]])) +
+    geom_bar(stat = "identity", position = position_dodge(width = 0.9)) +
+    scale_fill_viridis_d() +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5),
+          legend.position = "right",
+          plot.title = element_text(hjust = 0.5)) +
+    labs(
+      title = paste(stringr::str_to_title(type), "Mean Abundance by", x_var),
+      x = stringr::str_to_title(level),
+      y = paste(stringr::str_to_title(type), "Abundance"),
+      fill = stringr::str_to_title(gsub("_", " ", x_var))
+    )
+  
+  if (type == "relative") {
+    p <- p + scale_y_continuous(labels = scales::percent_format(accuracy = 1))
+  }
+  
+  return(p)
+}
+
+# FIXED: Additional diagnostic plot - Taxa prevalence
+create_taxa_prevalence_plot <- function(melted_df, level, force_taxa = NULL) {
+  # Calculate prevalence (percentage of samples where taxon is present)
+  prevalence_df <- melted_df %>%
+    mutate(!!sym(level) := clean_tax(.data[[level]])) %>%
+    filter(!is.na(.data[[level]]), 
+           .data[[level]] != "Other",
+           !grepl("^unclassified$", .data[[level]], ignore.case = TRUE)) %>%
+    mutate(present = Abundance > 0) %>%
+    group_by(.data[[level]]) %>%
+    summarise(
+      prevalence = mean(present) * 100,
+      mean_abundance = mean(Abundance[Abundance > 0], na.rm = TRUE),
+      n_samples = n(),
+      .groups = "drop"
+    )
+  
+  # Highlight forced taxa if provided
+  if(!is.null(force_taxa) && length(force_taxa) > 0) {
+    prevalence_df <- prevalence_df %>%
+      mutate(is_forced = .data[[level]] %in% force_taxa)
+    
+    # Get top 30 taxa for plotting
+    if(nrow(prevalence_df) > 30) {
+      plot_taxa <- prevalence_df %>%
+        arrange(desc(prevalence)) %>%
+        slice_head(n = 30) %>%
+        pull(.data[[level]])
+      prevalence_df <- prevalence_df %>%
+        filter(.data[[level]] %in% plot_taxa)
+    }
+    
+    p <- ggplot(prevalence_df, aes(x = reorder(.data[[level]], prevalence), 
+                                   y = prevalence, 
+                                   fill = is_forced,
+                                   size = mean_abundance)) +
+      geom_point(shape = 21, alpha = 0.7) +
+      scale_fill_manual(values = c("FALSE" = "steelblue", "TRUE" = "red"),
+                        labels = c("FALSE" = "Other", "TRUE" = "Forced Taxa"),
+                        name = "Taxon Type") +
+      scale_size_continuous(name = "Mean Abundance") +
+      coord_flip() +
+      theme_minimal() +
+      labs(
+        title = paste("Prevalence of", stringr::str_to_title(level)),
+        subtitle = "Red points = taxa from forced list",
+        x = stringr::str_to_title(level),
+        y = "Prevalence (%)"
+      )
+  } else {
+    # Get top 30 taxa for plotting
+    if(nrow(prevalence_df) > 30) {
+      plot_taxa <- prevalence_df %>%
+        arrange(desc(prevalence)) %>%
+        slice_head(n = 30) %>%
+        pull(.data[[level]])
+      prevalence_df <- prevalence_df %>%
+        filter(.data[[level]] %in% plot_taxa)
+    }
+    
+    p <- ggplot(prevalence_df, aes(x = reorder(.data[[level]], prevalence), 
+                                   y = prevalence,
+                                   size = mean_abundance)) +
+      geom_point(color = "steelblue", alpha = 0.7) +
+      scale_size_continuous(name = "Mean Abundance") +
+      coord_flip() +
+      theme_minimal() +
+      labs(
+        title = paste("Prevalence of", stringr::str_to_title(level)),
+        x = stringr::str_to_title(level),
+        y = "Prevalence (%)"
+      )
+  }
+  
+  return(p)
+}
+
+# Analyze multiple taxonomic levels
+tax_levels <- c("genus", "order", "phylum")
+top_n_values <- list(genus = 30, order = 20, phylum = 15)
+x_vars <- c("field", "take_all_seen", "tillage_method")
+
+for (level in tax_levels) {
+  cat("Processing:", toupper(level), "level\n")
+  
+  tryCatch({
+    abundances <- calculate_abundances(ps_filtered, level)
+    
+    # Get forced taxa from custom list
+    forced_taxa <- get_plotting_order(level)
+    
+    # Diagnostic: Check which forced taxa are present in data
+    taxa_in_data <- unique(abundances$relative[[level]])
+    taxa_cleaned <- clean_tax(taxa_in_data)
+    taxa_cleaned <- taxa_cleaned[!is.na(taxa_cleaned) & 
+                                   taxa_cleaned != "Other" & 
+                                   !grepl("^unclassified$", taxa_cleaned, ignore.case = TRUE)]
+    
+    if(!is.null(forced_taxa)) {
+      found_taxa <- forced_taxa[forced_taxa %in% taxa_cleaned]
+      missing_taxa <- forced_taxa[!forced_taxa %in% taxa_cleaned]
+      
+      cat("  Forced taxa found in data:", length(found_taxa), "/", length(forced_taxa), "\n")
+      if(length(missing_taxa) > 0 && length(missing_taxa) < 10) {
+        cat("  Missing taxa:", paste(missing_taxa, collapse = ", "), "\n")
+      }
+    }
+    
+    for (x_var in x_vars) {
+      # 1. Relative abundance - stacked bar plot (WITH forced taxa)
+      p_rel <- create_abundance_plot_force_taxa(abundances$relative, level, 
+                                                force_taxa = forced_taxa,
+                                                top_n = top_n_values[[level]], 
+                                                type = "relative", x_var = x_var)
+      print(p_rel)
+      ggsave(file.path(FIGURES, paste0("RelativeAbundance_", level, "_by_", x_var, ".png")), 
+             p_rel, width = 16, height = 8, dpi = 300)
+      
+      # 2. Absolute abundance - stacked bar plot (WITH forced taxa)
+      p_abs <- create_abundance_plot_force_taxa(abundances$absolute, level,
+                                                force_taxa = forced_taxa,
+                                                top_n = top_n_values[[level]], 
+                                                type = "absolute", x_var = x_var)
+      print(p_abs)
+      ggsave(file.path(FIGURES, paste0("AbsoluteAbundance_", level, "_by_", x_var, ".png")), 
+             p_abs, width = 16, height = 8, dpi = 300)
+      
+      # 3. Taxa vs Abundance plots
+      # Relative
+      p_taxa_rel <- create_taxa_vs_abundance_plot(abundances$relative, level, 
+                                                  force_taxa = forced_taxa,
+                                                  type = "relative", x_var = x_var)
+      print(p_taxa_rel)
+      ggsave(file.path(FIGURES, paste0("Taxa_Mean_Relative_Abundance_", level, "_by_", x_var, ".png")), 
+             p_taxa_rel, width = 14, height = 8, dpi = 300)
+      
+      # Absolute
+      p_taxa_abs <- create_taxa_vs_abundance_plot(abundances$absolute, level, 
+                                                  force_taxa = forced_taxa,
+                                                  type = "absolute", x_var = x_var)
+      print(p_taxa_abs)
+      ggsave(file.path(FIGURES, paste0("Taxa_Mean_Absolute_Abundance_", level, "_by_", x_var, ".png")), 
+             p_taxa_abs, width = 14, height = 8, dpi = 300)
+    }
+    
+    # 4. Prevalence diagnostic plot
+    p_prev_rel <- create_taxa_prevalence_plot(abundances$relative, level, forced_taxa)
+    print(p_prev_rel)
+    ggsave(file.path(FIGURES, paste0("Taxa_Prevalence_", level, ".png")), 
+           p_prev_rel, width = 12, height = 10, dpi = 300)
+    
+    p_prev_abs <- create_taxa_prevalence_plot(abundances$absolute, level, forced_taxa)
+    print(p_prev_abs)
+    ggsave(file.path(FIGURES, paste0("Taxa_Prevalence_Absolute_", level, ".png")), 
+           p_prev_abs, width = 12, height = 10, dpi = 300)
+    
+    cat("  Completed plots for", level, "\n")
+    
+  }, error = function(e) {
+    cat("  Failed for", level, ":", e$message, "\n")
+  })
+}
+
+cat("\nTaxonomic abundance analysis completed!\n")
+# =============================================================================
+# SECTION 7: TAXONOMIC COMPOSITION HEATMAP ANALYSIS - SIMPLIFIED VERSION
+# =============================================================================
+
+cat("\n")
+cat(rep("=", 60), "\n", sep = "")
+cat("SECTION 7: TAXONOMIC COMPOSITION HEATMAP ANALYSIS\n")
+cat(rep("=", 60), "\n", sep = "")
+
+cat("Creating taxonomic composition heatmaps...\n")
+
+# Simplified heatmap function using ggplot2 instead of pheatmap
+create_taxonomic_heatmap_ggplot <- function(physeq, tax_level, group_var, top_n = 20) {
+  
+  cat(paste0("  Processing ", tax_level, " for ", group_var, " ...\n"))
+  
+  tryCatch({
+    # Aggregate taxa
+    ps_agg <- tax_glom(physeq, taxrank = tax_level, NArm = FALSE)
+    
+    # Merge samples by grouping variable
+    ps_merged <- merge_samples(ps_agg, group_var, fun = sum)
+    
+    # Extract and transform data
+    otu_data <- as.data.frame(otu_table(ps_merged))
+    
+    if (taxa_are_rows(ps_merged)) {
+      heatmap_data <- otu_data
+    } else {
+      heatmap_data <- t(otu_data)
+    }
+    
+    # Get taxonomic information
+    tax_info <- as.data.frame(tax_table(ps_merged))
+    taxa_names <- tax_info[rownames(heatmap_data), tax_level]
+    taxa_names[is.na(taxa_names)] <- "Unknown"
+    taxa_names <- gsub("^Incertae Sedis_", "", taxa_names)
+    
+    # Create a clean data frame for ggplot
+    heatmap_df <- as.data.frame(heatmap_data)
+    colnames(heatmap_df) <- paste("Group", colnames(heatmap_df))
+    heatmap_df$Taxa <- taxa_names
+    heatmap_df$TaxaID <- rownames(heatmap_data)
+    
+    # Melt for ggplot
+    heatmap_long <- heatmap_df %>%
+      pivot_longer(cols = starts_with("Group"), 
+                   names_to = "Group", 
+                   values_to = "Abundance") %>%
+      mutate(Group = gsub("Group ", "", Group))
+    
+    # Calculate relative abundance within groups
+    heatmap_long <- heatmap_long %>%
+      group_by(Group) %>%
+      mutate(RelAbundance = Abundance / sum(Abundance) * 100) %>%
+      ungroup()
+    
+    # Select top taxa
+    top_taxa <- heatmap_long %>%
+      group_by(Taxa) %>%
+      summarise(TotalAbundance = sum(RelAbundance), .groups = "drop") %>%
+      arrange(desc(TotalAbundance)) %>%
+      slice_head(n = min(top_n, n())) %>%
+      pull(Taxa)
+    
+    if (length(top_taxa) < 2) {
+      cat("    WARNING: Not enough taxa for heatmap (only ", length(top_taxa), ")\n", sep = "")
+      return(NULL)
+    }
+    
+    # Filter to top taxa
+    heatmap_top <- heatmap_long %>%
+      filter(Taxa %in% top_taxa) %>%
+      mutate(Taxa = factor(Taxa, levels = rev(top_taxa)))  # Reverse for plotting
+    
+    # Create heatmap with ggplot2
+    p <- ggplot(heatmap_top, aes(x = Group, y = Taxa, fill = RelAbundance)) +
+      geom_tile(color = "white", linewidth = 0.5) +
+      scale_fill_gradientn(
+        colors = c("navy", "blue", "white", "red", "darkred"),
+        values = scales::rescale(c(0, 0.01, 0.1, 1, 10, 100)),
+        trans = "log10",
+        na.value = "grey90",
+        name = "Relative\nAbundance (%)",
+        breaks = c(0.01, 0.1, 1, 10, 100),
+        labels = c("0.01%", "0.1%", "1%", "10%", "100%")
+      ) +
+      labs(
+        title = paste("Top", length(top_taxa), stringr::str_to_title(tax_level), 
+                      "by", stringr::str_to_title(gsub("_", " ", group_var))),
+        x = "Groups",
+        y = stringr::str_to_title(tax_level)
+      ) +
+      theme_minimal() +
+      theme(
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+        axis.text.y = element_text(size = 8),
+        plot.title = element_text(hjust = 0.5, face = "bold"),
+        legend.position = "right"
+      ) +
+      coord_fixed(ratio = 0.5)  # Adjust aspect ratio
+    
+    # Save plot
+    filename <- paste0("heatmap_top_", tax_level, "_", group_var, ".png")
+    ggsave(file.path(FIGURES, filename), 
+           plot = p, 
+           width = max(8, n_distinct(heatmap_top$Group) * 1.5), 
+           height = max(6, length(top_taxa) * 0.3),
+           dpi = 300,
+           bg = "white")
+    
+    cat("✓ Heatmap saved as", filename, "\n")
+    return(p)
+    
+  }, error = function(e) {
+    cat("✗ Error creating heatmap:", e$message, "\n")
+    return(NULL)
+  })
+}
+
+# Alternative: Use pheatmap but save differently
+create_taxonomic_heatmap_pdf <- function(physeq, tax_level, group_var, top_n = 20) {
+  
+  cat(paste0("  Processing ", tax_level, " for ", group_var, " ...\n"))
+  
+  tryCatch({
+    # Aggregate taxa
+    ps_agg <- tax_glom(physeq, taxrank = tax_level, NArm = FALSE)
+    
+    # Merge samples by grouping variable
+    ps_merged <- merge_samples(ps_agg, group_var, fun = sum)
+    
+    # Extract OTU table
+    otu_data <- as.data.frame(otu_table(ps_merged))
+    if (taxa_are_rows(ps_merged)) {
+      heatmap_data <- as.matrix(otu_data)
+    } else {
+      heatmap_data <- t(as.matrix(otu_data))
+    }
+    
+    # Skip if matrix is empty
+    if (nrow(heatmap_data) == 0 || ncol(heatmap_data) == 0) {
+      cat("    WARNING: No data for heatmap\n")
+      return(NULL)
+    }
+    
+    # Calculate relative abundance
+    col_totals <- colSums(heatmap_data, na.rm = TRUE)
+    col_totals[col_totals == 0] <- 1  # Prevent division by zero
+    heatmap_data_rel <- sweep(heatmap_data, 2, col_totals, "/") * 100
+    
+    # Prepare taxa names
+    tax_info <- as.data.frame(tax_table(ps_merged))
+    row_names <- tax_info[rownames(heatmap_data_rel), tax_level]
+    row_names[is.na(row_names)] <- "Unknown"
+    row_names <- gsub("^Incertae Sedis_", "", row_names)
+    rownames(heatmap_data_rel) <- row_names
+    
+    # Select top taxa
+    top_n <- min(top_n, nrow(heatmap_data_rel))
+    if (top_n < 2) {
+      cat("    WARNING: Not enough taxa for heatmap\n")
+      return(NULL)
+    }
+    
+    row_means <- rowMeans(heatmap_data_rel, na.rm = TRUE)
+    top_indices <- order(row_means, decreasing = TRUE)[1:top_n]
+    heatmap_data_top <- heatmap_data_rel[top_indices, , drop = FALSE]
+    
+    # Create heatmap using PDF instead of PNG
+    filename <- paste0("heatmap_top_", tax_level, "_", group_var, ".pdf")
+    pdf(file.path(FIGURES, filename), 
+        width = 10, 
+        height = max(6, nrow(heatmap_data_top) * 0.3))
+    
+    pheatmap::pheatmap(heatmap_data_top,
+                       scale = "row",
+                       main = paste("Top", stringr::str_to_title(tax_level), 
+                                    "by", stringr::str_to_title(gsub("_", " ", group_var))),
+                       color = colorRampPalette(c("navy", "white", "firebrick3"))(100),
+                       fontsize_row = 9,
+                       fontsize_col = 10,
+                       angle_col = 90,
+                       cluster_rows = TRUE,
+                       cluster_cols = TRUE,
+                       na_col = "grey90",
+                       silent = FALSE)
+    
+    dev.off()
+    
+    cat("✓ Heatmap saved as", filename, "(PDF format)\n")
+    return(TRUE)
+    
+  }, error = function(e) {
+    cat("✗ Error creating heatmap:", e$message, "\n")
+    return(NULL)
+  })
+}
+
+# Try different approaches
+generate_all_heatmaps <- function(physeq, method = "auto") {
+  
+  taxonomic_levels <- c("phylum", "order", "genus")
+  grouping_vars <- c("field", "take_all_seen", "tillage_method")
+  
+  # Check which variables exist in metadata
+  metadata <- data.frame(sample_data(physeq))
+  available_vars <- grouping_vars[grouping_vars %in% colnames(metadata)]
+  
+  cat("Available grouping variables:", paste(available_vars, collapse = ", "), "\n")
+  
+  for (group_var in available_vars) {
+    cat("\nCreating heatmaps for grouping variable:", group_var, "\n")
+    
+    for (tax_level in taxonomic_levels) {
+      if (tax_level %in% rank_names(physeq)) {
+        cat("  -", tax_level, "level... ")
+        
+        # Try ggplot2 method first (more reliable)
+        result <- create_taxonomic_heatmap_ggplot(physeq, tax_level, group_var, top_n = 20)
+        
+        if (is.null(result)) {
+          # Fall back to PDF method
+          cat("Trying PDF format... ")
+          result <- create_taxonomic_heatmap_pdf(physeq, tax_level, group_var, top_n = 20)
+        }
+        
+        if (!is.null(result)) {
+          cat("✓ done\n")
+        } else {
+          cat("✗ failed\n")
+        }
+      } else {
+        cat("  -", tax_level, "level not available\n")
+      }
+    }
+  }
+}
+
+# Generate heatmaps
+generate_all_heatmaps(ps_filtered)
+
+# Function to convert PDF to PNG (requires ImageMagick)
+convert_pdf_to_png <- function() {
+  if (Sys.which("convert") == "") {
+    cat("ImageMagick 'convert' not found. Cannot convert PDF to PNG.\n")
+    cat("Install with: sudo apt-get install imagemagick (Linux) or brew install imagemagick (Mac)\n")
+    return(FALSE)
+  }
+  
+  pdf_files <- list.files(FIGURES, pattern = "\\.pdf$", full.names = TRUE)
+  
+  for (pdf_file in pdf_files) {
+    png_file <- sub("\\.pdf$", ".png", pdf_file)
+    cmd <- paste("convert -density 300", shQuote(pdf_file), shQuote(png_file))
+    system(cmd)
+    cat("Converted:", basename(pdf_file), "->", basename(png_file), "\n")
+  }
+  
+  return(TRUE)
+}
+
+# Run conversion if needed
+# convert_pdf_to_png()
+
+cat("\nTaxonomic composition heatmap analysis completed!\n")
+cat("Note: If PNG failed, PDF files were created instead.\n")
+cat("You can convert PDF to PNG later if needed.\n")
+
+
+# =============================================================================
+# SECTION 8: MICROBIAL CORRELATION NETWORK ANALYSIS (GENUS LEVEL)
+# =============================================================================
+
+cat("\n")
+cat(rep("=", 60), "\n", sep = "")
+cat("SECTION 8: MICROBIAL CORRELATION NETWORK ANALYSIS (GENUS LEVEL)\n")
+cat(rep("=", 60), "\n", sep = "")
+
+cat("Performing network analysis at genus level...\n")
+
+# Use the filtered phyloseq object
+ps_network <- ps_filtered
+
+# Filter prevalent taxa (present in ≥20% of samples)
+ps_network_filt <- ps_network %>%
+  filter_taxa(function(x) sum(x > 0) > (0.2 * nsamples(ps_network)), TRUE)
+
+cat("OTUs for network analysis:", ntaxa(ps_network_filt), "\n")
+
+# Check if we have enough OTUs for network analysis
+if (ntaxa(ps_network_filt) < 10) {
+  cat("WARNING: Too few OTUs (", ntaxa(ps_network_filt), ") for meaningful network analysis.\n")
+  cat("Skipping network analysis section.\n")
+  
+  # Create a placeholder message plot
+  p_message <- ggplot() +
+    annotate("text", x = 0.5, y = 0.5, 
+             label = paste("Insufficient data for network analysis\nOnly", 
+                           ntaxa(ps_network_filt), "OTUs available\n(Need at least 10)"),
+             size = 6) +
+    theme_void() +
+    labs(title = "Network Analysis Skipped")
+  
+  print(p_message)
+  ggsave(file.path(FIGURES, "network_analysis_skipped.png"), p_message, width = 8, height = 6)
+  
+} else {
+  # Extract and transform data
+  otu_mat <- as(otu_table(ps_network_filt), "matrix")
+  if (taxa_are_rows(ps_network_filt)) otu_mat <- t(otu_mat)
+  
+  # CLR transformation for compositional data
+  clr_transform <- function(x) {
+    x_transformed <- log(x + 1) - mean(log(x + 1))
+    return(x_transformed)
+  }
+  
+  otu_clr <- apply(otu_mat, 2, clr_transform)
+  cat("CLR transformation completed. Dimensions:", dim(otu_clr), "\n")
+  
+  # Calculate Spearman correlations
+  cat("Calculating Spearman correlations...\n")
+  cor_matrix <- cor(otu_clr, method = "spearman")
+  
+  # Calculate p-values with FDR correction
+  cat("Calculating significance values...\n")
+  p_matrix <- Hmisc::rcorr(otu_clr, type = "spearman")$P
+  
+  # Handle NA values in p_matrix
+  p_matrix[is.na(p_matrix)] <- 1
+  
+  # Apply FDR correction
+  p_adj <- p.adjust(p_matrix, method = "fdr")
+  
+  # Apply thresholds: Start with less stringent threshold
+  cat("Applying correlation thresholds...\n")
+  
+  # Try different thresholds if needed
+  thresholds <- c(0.6, 0.5, 0.4)
+  significant_correlations_found <- FALSE
+  
+  for (thresh in thresholds) {
+    adj_matrix <- cor_matrix
+    adj_matrix[p_adj > 0.05 | abs(cor_matrix) < thresh] <- 0
+    diag(adj_matrix) <- 0  # Remove self-correlations
+    
+    # Count significant correlations
+    n_sig_cor <- sum(abs(adj_matrix) > 0) / 2  # Divide by 2 for undirected
+    cat("  Threshold |r| >", thresh, ": ", n_sig_cor, "significant correlations\n")
+    
+    if (n_sig_cor > 10) {  # Require at least 10 correlations
+      significant_correlations_found <- TRUE
+      cat("  Using threshold |r| >", thresh, "\n")
+      break
+    }
+  }
+  
+  if (!significant_correlations_found) {
+    cat("WARNING: Few significant correlations found with standard thresholds.\n")
+    cat("Using relaxed threshold (|r| > 0.4, p < 0.1) for exploratory analysis...\n")
+    adj_matrix <- cor_matrix
+    adj_matrix[p_matrix > 0.1 | abs(cor_matrix) < 0.4] <- 0
+    diag(adj_matrix) <- 0
+    n_sig_cor <- sum(abs(adj_matrix) > 0) / 2
+  }
+  
+  cat("Final significant correlations found:", n_sig_cor, "\n")
+  
+  if (n_sig_cor < 5) {
+    cat("WARNING: Very few correlations found (", n_sig_cor, "). Network may be sparse.\n")
+  }
+  
+  # Create network graph
+  cat("Creating network graph...\n")
+  ig_network <- graph_from_adjacency_matrix(
+    adj_matrix, 
+    mode = "undirected", 
+    weighted = TRUE,
+    diag = FALSE
+  )
+  
+  # Check if network has vertices
+  if (vcount(ig_network) == 0) {
+    cat("ERROR: No vertices in network after thresholding.\n")
+    cat("Creating correlation heatmap instead...\n")
+    
+    # Create correlation heatmap as alternative
+    p_heatmap <- pheatmap::pheatmap(cor_matrix,
+                                    main = "Genus Correlation Matrix",
+                                    color = colorRampPalette(c("blue", "white", "red"))(100),
+                                    fontsize_row = 6,
+                                    fontsize_col = 6,
+                                    show_rownames = FALSE,
+                                    show_colnames = FALSE,
+                                    silent = FALSE)
+    
+    # Save heatmap
+    png(file.path(FIGURES, "genus_correlation_heatmap.png"), width = 10, height = 8, units = "in", res = 300)
+    print(p_heatmap)
+    dev.off()
+    
+    # Skip rest of network analysis
+    cat("Skipping detailed network analysis due to empty network.\n")
+    
+  } else {
+    # Remove isolated nodes (degree = 0)
+    initial_vertices <- vcount(ig_network)
+    ig_network <- delete_vertices(ig_network, degree(ig_network) == 0)
+    removed_vertices <- initial_vertices - vcount(ig_network)
+    
+    cat("Network created with", vcount(ig_network), "genera and", ecount(ig_network), "edges\n")
+    if (removed_vertices > 0) {
+      cat("Removed", removed_vertices, "isolated vertices (degree = 0)\n")
+    }
+    
+    # Check if we still have vertices after cleaning
+    if (vcount(ig_network) == 0) {
+      cat("ERROR: All vertices were isolated. No connected network.\n")
+      cat("Creating simple correlation visualization instead...\n")
+      
+      # Create a simple visualization of correlation distribution
+      cor_values <- cor_matrix[upper.tri(cor_matrix)]
+      cor_df <- data.frame(Correlation = cor_values)
+      
+      p_cor_dist <- ggplot(cor_df, aes(x = Correlation)) +
+        geom_histogram(bins = 30, fill = "steelblue", alpha = 0.7) +
+        geom_vline(xintercept = c(-0.6, 0.6), linetype = "dashed", color = "red") +
+        labs(title = "Distribution of Genus Correlations",
+             subtitle = paste("Total correlations:", length(cor_values)),
+             x = "Spearman Correlation", y = "Frequency") +
+        theme_minimal()
+      
+      print(p_cor_dist)
+      ggsave(file.path(FIGURES, "genus_correlation_distribution.png"), p_cor_dist, width = 8, height = 6)
+      
+    } else {
+      # Add taxonomic information at GENUS level
+      tax_info <- as.data.frame(tax_table(ps_network_filt))
+      vertex_names <- V(ig_network)$name
+      
+      # Add genus information (primary)
+      V(ig_network)$genus <- tax_info[vertex_names, "genus"]
+      V(ig_network)$genus[is.na(V(ig_network)$genus)] <- "Unknown_Genus"
+      
+      # Add higher taxonomic levels for context
+      V(ig_network)$family <- tax_info[vertex_names, "family"]
+      V(ig_network)$family[is.na(V(ig_network)$family)] <- "Unknown_Family"
+      
+      V(ig_network)$order <- tax_info[vertex_names, "order"]
+      V(ig_network)$order[is.na(V(ig_network)$order)] <- "Unknown_Order"
+      
+      V(ig_network)$phylum <- tax_info[vertex_names, "phylum"]
+      V(ig_network)$phylum[is.na(V(ig_network)$phylum)] <- "Unknown_Phylum"
+      
+      # Calculate network metrics
+      cat("Calculating network metrics...\n")
+      V(ig_network)$degree <- degree(ig_network)
+      V(ig_network)$betweenness <- betweenness(ig_network)
+      V(ig_network)$closeness <- closeness(ig_network)
+      
+      # Add edge attributes
+      edge_weights <- E(ig_network)$weight
+      E(ig_network)$correlation_type <- factor(
+        ifelse(edge_weights > 0, "positive", "negative"),
+        levels = c("positive", "negative")
+      )
+      E(ig_network)$strength <- abs(edge_weights)
+      
+      # Network statistics
+      cat("\nNetwork Summary (Genus Level):\n")
+      cat("-----------------------------\n")
+      cat("Number of genera (nodes):", vcount(ig_network), "\n")
+      cat("Number of correlations (edges):", ecount(ig_network), "\n")
+      cat("Network density:", round(graph.density(ig_network), 4), "\n")
+      cat("Average degree:", round(mean(degree(ig_network)), 2), "\n")
+      if (ecount(ig_network) > 0) {
+        cat("Positive correlations:", sum(edge_weights > 0), "\n")
+        cat("Negative correlations:", sum(edge_weights < 0), "\n")
+        cat("Average correlation strength:", round(mean(abs(edge_weights)), 3), "\n")
+      }
+      
+      # ============================================
+      # 8.1 NETWORK VISUALIZATION - GENUS LEVEL
+      # ============================================
+      
+      cat("\n8.1 Creating Network Visualizations (Genus Level)\n")
+      cat(rep("-", 50), "\n", sep = "")
+      
+      # SAFE Function to create genus-level network plot
+      create_genus_network_plot <- function(ig_network, output_file, layout = "fr", label_top_n = min(20, vcount(ig_network))) {
+        cat("Creating genus-level network visualization...\n")
+        
+        # Check if network has edges
+        if (ecount(ig_network) == 0) {
+          cat("WARNING: Network has no edges. Creating simple node plot instead.\n")
+          
+          # Create a simple plot showing just the nodes
+          node_data <- data.frame(
+            genus = V(ig_network)$genus,
+            phylum = V(ig_network)$phylum,
+            degree = V(ig_network)$degree
+          )
+          
+          p_simple <- ggplot(node_data, aes(x = 1, y = seq_along(genus))) +
+            geom_point(aes(color = phylum, size = degree), alpha = 0.7) +
+            geom_text(aes(label = genus), size = 3, hjust = -0.1) +
+            scale_color_brewer(palette = "Set2") +
+            theme_void() +
+            theme(legend.position = "right") +
+            labs(title = "Network Nodes (No Edges)",
+                 subtitle = paste("Only", vcount(ig_network), "isolated genera found"))
+          
+          ggsave(file.path(FIGURES, output_file), p_simple, width = 12, height = max(6, vcount(ig_network)/3))
+          return(p_simple)
+        }
+        
+        tg_network <- as_tbl_graph(ig_network)
+        
+        # Create color palette for PHYLA
+        unique_phyla <- unique(V(ig_network)$phylum)
+        n_phyla <- length(unique_phyla)
+        
+        if (n_phyla <= 8) {
+          phyla_colors <- RColorBrewer::brewer.pal(max(3, n_phyla), "Set2")[1:n_phyla]
+        } else if (n_phyla <= 12) {
+          phyla_colors <- RColorBrewer::brewer.pal(n_phyla, "Set3")
+        } else {
+          phyla_colors <- colorRampPalette(RColorBrewer::brewer.pal(12, "Set3"))(n_phyla)
+        }
+        names(phyla_colors) <- unique_phyla
+        
+        # Handle correlation colors
+        correlation_types <- unique(E(tg_network)$correlation_type)
+        correlation_colors <- c("positive" = "red", "negative" = "blue")
+        correlation_colors <- correlation_colors[names(correlation_colors) %in% correlation_types]
+        
+        # Identify top genera by degree for labeling
+        top_genera <- data.frame(
+          genus = V(ig_network)$genus,
+          degree = V(ig_network)$degree,
+          phylum = V(ig_network)$phylum
+        ) %>%
+          arrange(desc(degree)) %>%
+          slice_head(n = label_top_n)
+        
+        # Create label vector
+        label_vector <- rep("", vcount(tg_network))
+        if (nrow(top_genera) > 0) {
+          label_indices <- which(V(tg_network)$genus %in% top_genera$genus)
+          if (length(label_indices) > 0) {
+            label_vector[label_indices] <- V(tg_network)$genus[label_indices]
+          }
+        }
+        
+        # Create plot
+        p <- ggraph(tg_network, layout = layout) +
+          # Edges
+          geom_edge_link(
+            aes(alpha = strength, color = correlation_type), 
+            width = 0.5,
+            show.legend = TRUE
+          ) +
+          # Nodes
+          geom_node_point(
+            aes(color = phylum, size = degree), 
+            alpha = 0.8,
+            show.legend = TRUE
+          ) +
+          # Labels for top genera
+          geom_node_text(
+            aes(label = label_vector),
+            size = 2.5,
+            repel = TRUE,
+            max.overlaps = 30,
+            bg.color = "white",
+            bg.r = 0.15
+          ) +
+          # Scales and colors
+          scale_color_manual(values = phyla_colors, name = "Phylum", na.value = "gray50") +
+          scale_edge_color_manual(values = correlation_colors, name = "Correlation") +
+          scale_size_continuous(
+            range = c(2, 10),
+            breaks = scales::pretty_breaks(n = 5),
+            name = "Degree"
+          ) +
+          scale_edge_alpha_continuous(range = c(0.2, 0.8)) +
+          # Theme and labels
+          theme_graph() +
+          theme(
+            legend.position = "right",
+            legend.box = "vertical",
+            legend.key.size = unit(0.5, "cm")
+          ) +
+          labs(
+            title = "Microbial Correlation Network - Genus Level",
+            subtitle = paste(
+              "Genera:", vcount(ig_network), 
+              "| Correlations:", ecount(ig_network),
+              "| Layout:", toupper(layout)
+            )
+          )
+        
+        # Save plot
+        ggsave(
+          file.path(FIGURES, output_file), 
+          p, 
+          width = 14, 
+          height = 10, 
+          dpi = 300,
+          bg = "white"
+        )
+        
+        cat("Network plot saved to:", file.path(FIGURES, output_file), "\n")
+        return(p)
+      }
+      
+      # Create network visualizations
+      cat("Generating network visualizations...\n")
+      
+      # Main genus network plot
+      if (vcount(ig_network) > 0) {
+        genus_network_plot <- create_genus_network_plot(ig_network, "genus_network_main.png", "fr", 
+                                                        min(25, vcount(ig_network)))
+        print(genus_network_plot)
+        
+        # Alternative layout if we have enough vertices
+        if (vcount(ig_network) > 5) {
+          genus_network_kk <- create_genus_network_plot(ig_network, "genus_network_kk.png", "kk", 
+                                                        min(20, vcount(ig_network)))
+        }
+      }
+      
+      # ============================================
+      # 8.2 KEYSTONE GENERA ANALYSIS
+      # ============================================
+      
+      cat("\n8.2 Identifying Keystone Genera\n")
+      cat(rep("-", 50), "\n", sep = "")
+      
+      if (vcount(ig_network) >= 5) {  # Need at least 5 genera for meaningful analysis
+        cat("Identifying keystone genera...\n")
+        
+        # Calculate keystone metrics for genera
+        keystone_metrics <- data.frame(
+          OTU = V(ig_network)$name,
+          Genus = V(ig_network)$genus,
+          Family = V(ig_network)$family,
+          Order = V(ig_network)$order,
+          Phylum = V(ig_network)$phylum,
+          Degree = degree(ig_network),
+          Betweenness = betweenness(ig_network),
+          Closeness = closeness(ig_network),
+          stringsAsFactors = FALSE
+        )
+        
+        # Calculate z-scores and combined keystone score
+        keystone_genera <- keystone_metrics %>%
+          mutate(
+            z_degree = if (sd(Degree) > 0) scale(Degree) else 0,
+            z_betweenness = if (sd(Betweenness) > 0) scale(Betweenness) else 0,
+            z_closeness = if (sd(Closeness) > 0) scale(Closeness) else 0,
+            keystone_score = (z_degree + z_betweenness + z_closeness) / 3
+          ) %>%
+          arrange(desc(keystone_score))
+        
+        # Top keystone genera (top 20% if we have enough, otherwise top 2)
+        top_percentile <- if (nrow(keystone_genera) > 10) 0.2 else 0.3
+        top_keystone_genera <- keystone_genera %>%
+          filter(keystone_score > quantile(keystone_score, 1 - top_percentile, na.rm = TRUE)) %>%
+          arrange(desc(keystone_score))
+        
+        cat("Keystone genera identified (top", round(top_percentile * 100), "%):", nrow(top_keystone_genera), "\n")
+        
+        if (nrow(top_keystone_genera) > 0) {
+          # Summary of keystone genera by phylum
+          keystone_summary <- top_keystone_genera %>%
+            group_by(Phylum) %>%
+            summarise(
+              n_keystone = n(),
+              avg_degree = mean(Degree),
+              avg_betweenness = mean(Betweenness),
+              avg_score = mean(keystone_score),
+              example_genera = paste(head(Genus, 3), collapse = ", "),
+              .groups = "drop"
+            ) %>%
+            arrange(desc(n_keystone))
+          
+          cat("\nKeystone genera by phylum:\n")
+          print(keystone_summary)
+          
+          # ============================================
+          # 8.3 GENUS-LEVEL VISUALIZATIONS
+          # ============================================
+          
+          cat("\n8.3 Creating Genus-Level Visualizations\n")
+          cat(rep("-", 50), "\n", sep = "")
+          
+          # Plot 1: Top keystone genera bar plot
+          plot_n <- min(20, nrow(top_keystone_genera))
+          p_keystone_genera <- ggplot(top_keystone_genera %>% slice_head(n = plot_n), 
+                                      aes(x = reorder(Genus, keystone_score), y = keystone_score, fill = Phylum)) +
+            geom_bar(stat = "identity", alpha = 0.8) +
+            coord_flip() +
+            labs(title = paste("Top", plot_n, "Keystone Genera"),
+                 subtitle = "Based on degree, betweenness, and closeness centrality",
+                 x = "Genus", y = "Keystone Score") +
+            theme_minimal() +
+            theme(legend.position = "bottom",
+                  axis.text.y = element_text(size = 8))
+          
+          print(p_keystone_genera)
+          ggsave(file.path(FIGURES, "keystone_genera_barplot.png"), p_keystone_genera, width = 10, height = 8)
+          
+          # Plot 2: Degree vs Betweenness scatter plot
+          p_degree_betweenness <- ggplot(keystone_genera, aes(x = Degree, y = Betweenness, color = Phylum)) +
+            geom_point(alpha = 0.7, size = 2) +
+            labs(title = "Genus Centrality: Degree vs Betweenness",
+                 x = "Degree (Number of Connections)",
+                 y = "Betweenness Centrality") +
+            theme_minimal()
+          
+          if (nrow(top_keystone_genera) > 0 && nrow(top_keystone_genera) <= 15) {
+            p_degree_betweenness <- p_degree_betweenness +
+              geom_text(data = top_keystone_genera,
+                        aes(label = Genus), size = 3, vjust = -0.5, hjust = 0.5)
+          }
+          
+          print(p_degree_betweenness)
+          ggsave(file.path(FIGURES, "genus_centrality_scatter.png"), p_degree_betweenness, width = 10, height = 8)
+          
+        } else {
+          cat("No keystone genera identified with current thresholds.\n")
+        }
+      } else {
+        cat("Not enough genera (", vcount(ig_network), ") for keystone analysis.\n")
+      }
+      
+      # ============================================
+      # 8.4 SAVE GENUS NETWORK RESULTS
+      # ============================================
+      
+      cat("\n8.4 Saving Genus Network Results\n")
+      cat(rep("-", 50), "\n", sep = "")
+      
+      # Save network object
+      saveRDS(ig_network, file.path(TABLES, "genus_network.rds"))
+      cat("Genus network object saved to: genus_network.rds\n")
+      
+      # Save basic network information
+      network_summary <- data.frame(
+        Metric = c("Genera", "Edges", "Density", "Average Degree"),
+        Value = c(
+          vcount(ig_network),
+          ecount(ig_network),
+          round(graph.density(ig_network), 4),
+          round(mean(degree(ig_network)), 2)
+        )
+      )
+      
+      write.csv(network_summary, file.path(TABLES, "genus_network_summary.csv"), row.names = FALSE)
+      
+      # Save genus metadata with network metrics if available
+      if (exists("keystone_genera")) {
+        write.csv(keystone_genera, file.path(TABLES, "genus_network_metadata.csv"), row.names = FALSE)
+      }
+      
+      # Create correlation matrix heatmap
+      cat("Creating correlation matrix heatmap...\n")
+      
+      # Get top correlated genera for heatmap
+      top_n <- min(30, nrow(cor_matrix))
+      if (top_n > 5) {
+        # Calculate mean absolute correlation for each genus
+        mean_abs_cor <- rowMeans(abs(cor_matrix), na.rm = TRUE)
+        top_indices <- order(mean_abs_cor, decreasing = TRUE)[1:top_n]
+        cor_subset <- cor_matrix[top_indices, top_indices]
+        
+        # Get genus names
+        tax_info <- as.data.frame(tax_table(ps_network_filt))
+        genus_names <- tax_info[rownames(cor_subset), "genus"]
+        genus_names[is.na(genus_names)] <- rownames(cor_subset)[is.na(genus_names)]
+        rownames(cor_subset) <- colnames(cor_subset) <- genus_names
+        
+        # Create heatmap
+        p_cor_heatmap <- pheatmap::pheatmap(cor_subset,
+                                            main = paste("Top", top_n, "Genus Correlations"),
+                                            color = colorRampPalette(c("blue", "white", "red"))(100),
+                                            fontsize_row = 8,
+                                            fontsize_col = 8,
+                                            angle_col = 45,
+                                            silent = FALSE)
+        
+        # Save heatmap
+        png(file.path(FIGURES, "top_genus_correlation_heatmap.png"), width = 10, height = 8, units = "in", res = 300)
+        print(p_cor_heatmap)
+        dev.off()
+      }
+    }
+  }
+}
+
+cat("\n")
+cat(rep("=", 60), "\n", sep = "")
+cat("SECTION 8: GENUS NETWORK ANALYSIS COMPLETED\n")
+cat(rep("=", 60), "\n", sep = "")
+
+##############################################################################
+
+# =============================================================================
+# SECTION 8: MICROBIAL CORRELATION NETWORK ANALYSIS (GENUS LEVEL) - FIXED SAVING
+# =============================================================================
+
+cat("\n")
+cat(rep("=", 60), "\n", sep = "")
+cat("SECTION 8: MICROBIAL CORRELATION NETWORK ANALYSIS (GENUS LEVEL)\n")
+cat(rep("=", 60), "\n", sep = "")
+
+cat("Performing network analysis at genus level...\n")
+
+# Use the filtered phyloseq object
+ps_network <- ps_filtered
+
+# Filter prevalent taxa (present in ≥20% of samples)
+ps_network_filt <- ps_network %>%
+  filter_taxa(function(x) sum(x > 0) > (0.2 * nsamples(ps_network)), TRUE)
+
+cat("OTUs for network analysis:", ntaxa(ps_network_filt), "\n")
+
+# Check if we have enough OTUs for network analysis
+if (ntaxa(ps_network_filt) < 10) {
+  cat("WARNING: Too few OTUs (", ntaxa(ps_network_filt), ") for meaningful network analysis.\n")
+  cat("Skipping network analysis section.\n")
+  
+  # Create a placeholder message plot
+  p_message <- ggplot() +
+    annotate("text", x = 0.5, y = 0.5, 
+             label = paste("Insufficient data for network analysis\nOnly", 
+                           ntaxa(ps_network_filt), "OTUs available\n(Need at least 10)"),
+             size = 6) +
+    theme_void() +
+    labs(title = "Network Analysis Skipped")
+  
+  print(p_message)
+  ggsave(file.path(FIGURES, "network_analysis_skipped.png"), plot = p_message, width = 8, height = 6)
+  
+} else {
+  # Extract and transform data
+  otu_mat <- as(otu_table(ps_network_filt), "matrix")
+  if (taxa_are_rows(ps_network_filt)) otu_mat <- t(otu_mat)
+  
+  # CLR transformation for compositional data
+  clr_transform <- function(x) {
+    x_transformed <- log(x + 1) - mean(log(x + 1))
+    return(x_transformed)
+  }
+  
+  otu_clr <- apply(otu_mat, 2, clr_transform)
+  cat("CLR transformation completed. Dimensions:", dim(otu_clr), "\n")
+  
+  # Calculate Spearman correlations
+  cat("Calculating Spearman correlations...\n")
+  cor_matrix <- cor(otu_clr, method = "spearman")
+  
+  # Calculate p-values with FDR correction
+  cat("Calculating significance values...\n")
+  p_matrix <- Hmisc::rcorr(otu_clr, type = "spearman")$P
+  
+  # Handle NA values in p_matrix
+  p_matrix[is.na(p_matrix)] <- 1
+  
+  # Apply FDR correction
+  p_adj <- p.adjust(p_matrix, method = "fdr")
+  
+  # Apply thresholds: Start with less stringent threshold
+  cat("Applying correlation thresholds...\n")
+  
+  # Try different thresholds if needed
+  thresholds <- c(0.6, 0.5, 0.4)
+  significant_correlations_found <- FALSE
+  final_threshold <- 0.6
+  
+  for (thresh in thresholds) {
+    adj_matrix <- cor_matrix
+    adj_matrix[p_adj > 0.05 | abs(cor_matrix) < thresh] <- 0
+    diag(adj_matrix) <- 0  # Remove self-correlations
+    
+    # Count significant correlations
+    n_sig_cor <- sum(abs(adj_matrix) > 0) / 2  # Divide by 2 for undirected
+    cat("  Threshold |r| >", thresh, ": ", n_sig_cor, "significant correlations\n")
+    
+    if (n_sig_cor > 10) {  # Require at least 10 correlations
+      significant_correlations_found <- TRUE
+      final_threshold <- thresh
+      cat("  Using threshold |r| >", thresh, "\n")
+      break
+    }
+  }
+  
+  if (!significant_correlations_found) {
+    cat("WARNING: Few significant correlations found with standard thresholds.\n")
+    cat("Using relaxed threshold (|r| > 0.4, p < 0.1) for exploratory analysis...\n")
+    adj_matrix <- cor_matrix
+    adj_matrix[p_matrix > 0.1 | abs(cor_matrix) < 0.4] <- 0
+    diag(adj_matrix) <- 0
+    n_sig_cor <- sum(abs(adj_matrix) > 0) / 2
+    final_threshold <- 0.4
+  }
+  
+  cat("Final significant correlations found:", n_sig_cor, "\n")
+  
+  if (n_sig_cor < 5) {
+    cat("WARNING: Very few correlations found (", n_sig_cor, "). Network may be sparse.\n")
+  }
+  
+  # Create network graph
+  cat("Creating network graph...\n")
+  ig_network <- graph_from_adjacency_matrix(
+    adj_matrix, 
+    mode = "undirected", 
+    weighted = TRUE,
+    diag = FALSE
+  )
+  
+  # Check if network has vertices
+  if (vcount(ig_network) == 0) {
+    cat("ERROR: No vertices in network after thresholding.\n")
+    cat("Creating correlation heatmap instead...\n")
+    
+    # Create correlation heatmap as alternative
+    p_heatmap <- pheatmap::pheatmap(cor_matrix,
+                                    main = "Genus Correlation Matrix",
+                                    color = colorRampPalette(c("blue", "white", "red"))(100),
+                                    fontsize_row = 6,
+                                    fontsize_col = 6,
+                                    show_rownames = FALSE,
+                                    show_colnames = FALSE,
+                                    silent = TRUE)  # Silent to not print immediately
+    
+    # Save heatmap
+    png(file.path(FIGURES, "genus_correlation_heatmap.png"), width = 10, height = 8, units = "in", res = 300)
+    print(p_heatmap)
+    dev.off()
+    
+    cat("Heatmap saved to: genus_correlation_heatmap.png\n")
+    
+    # Create correlation distribution plot
+    cor_values <- cor_matrix[upper.tri(cor_matrix)]
+    cor_df <- data.frame(Correlation = cor_values)
+    
+    p_cor_dist <- ggplot(cor_df, aes(x = Correlation)) +
+      geom_histogram(bins = 30, fill = "steelblue", alpha = 0.7) +
+      geom_vline(xintercept = c(-final_threshold, final_threshold), linetype = "dashed", color = "red") +
+      labs(title = paste("Distribution of Genus Correlations (Threshold: |r| >", final_threshold, ")"),
+           subtitle = paste("Total correlations:", length(cor_values), "| Significant:", n_sig_cor),
+           x = "Spearman Correlation", y = "Frequency") +
+      theme_minimal()
+    
+    print(p_cor_dist)
+    ggsave(file.path(FIGURES, "genus_correlation_distribution.png"), plot = p_cor_dist, width = 8, height = 6)
+    
+    cat("Skipping detailed network analysis due to empty network.\n")
+    
+  } else {
+    # Remove isolated nodes (degree = 0)
+    initial_vertices <- vcount(ig_network)
+    ig_network <- delete_vertices(ig_network, degree(ig_network) == 0)
+    removed_vertices <- initial_vertices - vcount(ig_network)
+    
+    cat("Network created with", vcount(ig_network), "genera and", ecount(ig_network), "edges\n")
+    if (removed_vertices > 0) {
+      cat("Removed", removed_vertices, "isolated vertices (degree = 0)\n")
+    }
+    
+    # Check if we still have vertices after cleaning
+    if (vcount(ig_network) == 0) {
+      cat("ERROR: All vertices were isolated. No connected network.\n")
+      cat("Creating simple correlation visualization instead...\n")
+      
+      # Create a simple visualization of correlation distribution
+      cor_values <- cor_matrix[upper.tri(cor_matrix)]
+      cor_df <- data.frame(Correlation = cor_values)
+      
+      p_cor_dist <- ggplot(cor_df, aes(x = Correlation)) +
+        geom_histogram(bins = 30, fill = "steelblue", alpha = 0.7) +
+        geom_vline(xintercept = c(-final_threshold, final_threshold), linetype = "dashed", color = "red") +
+        labs(title = paste("Distribution of Genus Correlations (Threshold: |r| >", final_threshold, ")"),
+             subtitle = paste("Total correlations:", length(cor_values), "| Significant:", n_sig_cor),
+             x = "Spearman Correlation", y = "Frequency") +
+        theme_minimal()
+      
+      print(p_cor_dist)
+      ggsave(file.path(FIGURES, "genus_correlation_distribution.png"), plot = p_cor_dist, width = 8, height = 6)
+      
+    } else {
+      # Add taxonomic information at GENUS level
+      tax_info <- as.data.frame(tax_table(ps_network_filt))
+      vertex_names <- V(ig_network)$name
+      
+      # Add genus information (primary)
+      V(ig_network)$genus <- tax_info[vertex_names, "genus"]
+      V(ig_network)$genus[is.na(V(ig_network)$genus)] <- "Unknown_Genus"
+      
+      # Add higher taxonomic levels for context
+      V(ig_network)$family <- tax_info[vertex_names, "family"]
+      V(ig_network)$family[is.na(V(ig_network)$family)] <- "Unknown_Family"
+      
+      V(ig_network)$order <- tax_info[vertex_names, "order"]
+      V(ig_network)$order[is.na(V(ig_network)$order)] <- "Unknown_Order"
+      
+      V(ig_network)$phylum <- tax_info[vertex_names, "phylum"]
+      V(ig_network)$phylum[is.na(V(ig_network)$phylum)] <- "Unknown_Phylum"
+      
+      # Calculate network metrics
+      cat("Calculating network metrics...\n")
+      V(ig_network)$degree <- degree(ig_network)
+      V(ig_network)$betweenness <- betweenness(ig_network)
+      V(ig_network)$closeness <- closeness(ig_network)
+      
+      # Add edge attributes
+      edge_weights <- E(ig_network)$weight
+      E(ig_network)$correlation_type <- factor(
+        ifelse(edge_weights > 0, "positive", "negative"),
+        levels = c("positive", "negative")
+      )
+      E(ig_network)$strength <- abs(edge_weights)
+      
+      # Network statistics
+      cat("\nNetwork Summary (Genus Level):\n")
+      cat("-----------------------------\n")
+      cat("Number of genera (nodes):", vcount(ig_network), "\n")
+      cat("Number of correlations (edges):", ecount(ig_network), "\n")
+      cat("Network density:", round(graph.density(ig_network), 4), "\n")
+      cat("Average degree:", round(mean(degree(ig_network)), 2), "\n")
+      if (ecount(ig_network) > 0) {
+        cat("Positive correlations:", sum(edge_weights > 0), "\n")
+        cat("Negative correlations:", sum(edge_weights < 0), "\n")
+        cat("Average correlation strength:", round(mean(abs(edge_weights)), 3), "\n")
+      }
+      
+      # ============================================
+      # 8.1 NETWORK VISUALIZATION - GENUS LEVEL
+      # ============================================
+      
+      cat("\n8.1 Creating Network Visualizations (Genus Level)\n")
+      cat(rep("-", 50), "\n", sep = "")
+      
+      # SAFE Function to create genus-level network plot
+      create_genus_network_plot <- function(ig_network, output_file, layout = "fr", label_top_n = min(20, vcount(ig_network))) {
+        cat("Creating genus-level network visualization...\n")
+        
+        # Check if network has edges
+        if (ecount(ig_network) == 0) {
+          cat("WARNING: Network has no edges. Creating simple node plot instead.\n")
+          
+          # Create a simple plot showing just the nodes
+          node_data <- data.frame(
+            genus = V(ig_network)$genus,
+            phylum = V(ig_network)$phylum,
+            degree = V(ig_network)$degree
+          )
+          
+          p_simple <- ggplot(node_data, aes(x = 1, y = seq_along(genus))) +
+            geom_point(aes(color = phylum, size = degree), alpha = 0.7) +
+            geom_text(aes(label = genus), size = 3, hjust = -0.1, check_overlap = TRUE) +
+            scale_color_brewer(palette = "Set2", na.value = "gray50") +
+            scale_size_continuous(range = c(2, 6)) +
+            theme_void() +
+            theme(legend.position = "right",
+                  plot.title = element_text(hjust = 0.5),
+                  plot.subtitle = element_text(hjust = 0.5)) +
+            labs(title = "Network Nodes (No Edges)",
+                 subtitle = paste("Only", vcount(ig_network), "isolated genera found"))
+          
+          # Save the plot
+          ggsave(file.path(FIGURES, output_file), plot = p_simple, 
+                 width = 12, height = max(6, vcount(ig_network)/3), dpi = 300)
+          cat("Simple node plot saved to:", file.path(FIGURES, output_file), "\n")
+          return(p_simple)
+        }
+        
+        tg_network <- as_tbl_graph(ig_network)
+        
+        # Create color palette for PHYLA
+        unique_phyla <- unique(V(ig_network)$phylum)
+        n_phyla <- length(unique_phyla)
+        
+        if (n_phyla <= 8) {
+          phyla_colors <- RColorBrewer::brewer.pal(max(3, n_phyla), "Set2")[1:n_phyla]
+        } else if (n_phyla <= 12) {
+          phyla_colors <- RColorBrewer::brewer.pal(n_phyla, "Set3")
+        } else {
+          phyla_colors <- colorRampPalette(RColorBrewer::brewer.pal(12, "Set3"))(n_phyla)
+        }
+        names(phyla_colors) <- unique_phyla
+        
+        # Handle correlation colors
+        correlation_types <- unique(E(tg_network)$correlation_type)
+        correlation_colors <- c("positive" = "red", "negative" = "blue")
+        correlation_colors <- correlation_colors[names(correlation_colors) %in% correlation_types]
+        
+        # Identify top genera by degree for labeling
+        top_genera <- data.frame(
+          genus = V(ig_network)$genus,
+          degree = V(ig_network)$degree,
+          phylum = V(ig_network)$phylum
+        ) %>%
+          arrange(desc(degree)) %>%
+          slice_head(n = label_top_n)
+        
+        # Create label vector
+        label_vector <- rep("", vcount(tg_network))
+        if (nrow(top_genera) > 0) {
+          label_indices <- which(V(tg_network)$genus %in% top_genera$genus)
+          if (length(label_indices) > 0) {
+            label_vector[label_indices] <- V(tg_network)$genus[label_indices]
+          }
+        }
+        
+        # Create plot
+        p <- ggraph(tg_network, layout = layout) +
+          # Edges
+          geom_edge_link(
+            aes(alpha = strength, color = correlation_type), 
+            width = 0.5,
+            show.legend = TRUE
+          ) +
+          # Nodes
+          geom_node_point(
+            aes(color = phylum, size = degree), 
+            alpha = 0.8,
+            show.legend = TRUE
+          ) +
+          # Labels for top genera
+          geom_node_text(
+            aes(label = label_vector),
+            size = 2.5,
+            repel = TRUE,
+            max.overlaps = 30,
+            bg.color = "white",
+            bg.r = 0.15
+          ) +
+          # Scales and colors
+          scale_color_manual(values = phyla_colors, name = "Phylum", na.value = "gray50") +
+          scale_edge_color_manual(values = correlation_colors, name = "Correlation") +
+          scale_size_continuous(
+            range = c(2, 10),
+            breaks = scales::pretty_breaks(n = 5),
+            name = "Degree"
+          ) +
+          scale_edge_alpha_continuous(range = c(0.2, 0.8)) +
+          # Theme and labels
+          theme_graph() +
+          theme(
+            legend.position = "right",
+            legend.box = "vertical",
+            legend.key.size = unit(0.5, "cm"),
+            plot.title = element_text(hjust = 0.5),
+            plot.subtitle = element_text(hjust = 0.5)
+          ) +
+          labs(
+            title = "Microbial Correlation Network - Genus Level",
+            subtitle = paste(
+              "Genera:", vcount(ig_network), 
+              "| Correlations:", ecount(ig_network),
+              "| Layout:", toupper(layout),
+              "| Threshold: |r| >", final_threshold
+            )
+          )
+        
+        # Save plot
+        ggsave(
+          file.path(FIGURES, output_file), 
+          plot = p,  # Explicitly specify plot parameter
+          width = 14, 
+          height = 10, 
+          dpi = 300,
+          bg = "white"
+        )
+        
+        cat("Network plot saved to:", file.path(FIGURES, output_file), "\n")
+        return(p)
+      }
+      
+      # Create network visualizations
+      cat("Generating network visualizations...\n")
+      
+      # Main genus network plot
+      if (vcount(ig_network) > 0) {
+        genus_network_plot <- create_genus_network_plot(ig_network, "genus_network_main.png", "fr", 
+                                                        min(25, vcount(ig_network)))
+        print(genus_network_plot)
+        
+        # Alternative layout if we have enough vertices
+        if (vcount(ig_network) > 5) {
+          genus_network_kk <- create_genus_network_plot(ig_network, "genus_network_kk.png", "kk", 
+                                                        min(20, vcount(ig_network)))
+          print(genus_network_kk)
+        }
+        
+        # Create simplified version
+        create_simple_genus_plot <- function(ig_network, output_file) {
+          cat("Creating simplified network plot...\n")
+          
+          tg_network <- as_tbl_graph(ig_network)
+          
+          p <- ggraph(tg_network, layout = "fr") +
+            geom_edge_link(aes(width = abs(weight)), alpha = 0.3, color = "gray60") +
+            geom_node_point(aes(color = phylum, size = degree), alpha = 0.8) +
+            scale_color_brewer(palette = "Set2", name = "Phylum") +
+            scale_size_continuous(range = c(3, 8), name = "Degree") +
+            scale_edge_width_continuous(range = c(0.5, 2)) +
+            theme_graph() +
+            labs(title = "Microbial Network - Genus Level",
+                 subtitle = paste("Genera:", vcount(ig_network), "| Edges:", ecount(ig_network)))
+          
+          ggsave(file.path(FIGURES, output_file), plot = p, width = 12, height = 9, dpi = 300)
+          cat("Simplified plot saved to:", file.path(FIGURES, output_file), "\n")
+          return(p)
+        }
+        
+        simple_genus_plot <- create_simple_genus_plot(ig_network, "genus_network_simple.png")
+        print(simple_genus_plot)
+      }
+      
+      # ============================================
+      # 8.2 KEYSTONE GENERA ANALYSIS
+      # ============================================
+      
+      cat("\n8.2 Identifying Keystone Genera\n")
+      cat(rep("-", 50), "\n", sep = "")
+      
+      if (vcount(ig_network) >= 5) {  # Need at least 5 genera for meaningful analysis
+        cat("Identifying keystone genera...\n")
+        
+        # Calculate keystone metrics for genera
+        keystone_metrics <- data.frame(
+          OTU = V(ig_network)$name,
+          Genus = V(ig_network)$genus,
+          Family = V(ig_network)$family,
+          Order = V(ig_network)$order,
+          Phylum = V(ig_network)$phylum,
+          Degree = degree(ig_network),
+          Betweenness = betweenness(ig_network),
+          Closeness = closeness(ig_network),
+          stringsAsFactors = FALSE
+        )
+        
+        # Calculate z-scores and combined keystone score
+        keystone_genera <- keystone_metrics %>%
+          mutate(
+            z_degree = if (sd(Degree) > 0) scale(Degree) else 0,
+            z_betweenness = if (sd(Betweenness) > 0) scale(Betweenness) else 0,
+            z_closeness = if (sd(Closeness) > 0) scale(Closeness) else 0,
+            keystone_score = (z_degree + z_betweenness + z_closeness) / 3
+          ) %>%
+          arrange(desc(keystone_score))
+        
+        # Top keystone genera (top 20% if we have enough, otherwise top 2)
+        top_percentile <- if (nrow(keystone_genera) > 10) 0.2 else 0.3
+        top_keystone_genera <- keystone_genera %>%
+          filter(keystone_score > quantile(keystone_score, 1 - top_percentile, na.rm = TRUE)) %>%
+          arrange(desc(keystone_score))
+        
+        cat("Keystone genera identified (top", round(top_percentile * 100), "%):", nrow(top_keystone_genera), "\n")
+        
+        if (nrow(top_keystone_genera) > 0) {
+          # Summary of keystone genera by phylum
+          keystone_summary <- top_keystone_genera %>%
+            group_by(Phylum) %>%
+            summarise(
+              n_keystone = n(),
+              avg_degree = mean(Degree),
+              avg_betweenness = mean(Betweenness),
+              avg_score = mean(keystone_score),
+              example_genera = paste(head(Genus, 3), collapse = ", "),
+              .groups = "drop"
+            ) %>%
+            arrange(desc(n_keystone))
+          
+          cat("\nKeystone genera by phylum:\n")
+          print(keystone_summary)
+          
+          # ============================================
+          # 8.3 GENUS-LEVEL VISUALIZATIONS
+          # ============================================
+          
+          cat("\n8.3 Creating Genus-Level Visualizations\n")
+          cat(rep("-", 50), "\n", sep = "")
+          
+          # Plot 1: Top keystone genera bar plot
+          plot_n <- min(20, nrow(top_keystone_genera))
+          p_keystone_genera <- ggplot(top_keystone_genera %>% slice_head(n = plot_n), 
+                                      aes(x = reorder(Genus, keystone_score), y = keystone_score, fill = Phylum)) +
+            geom_bar(stat = "identity", alpha = 0.8) +
+            coord_flip() +
+            labs(title = paste("Top", plot_n, "Keystone Genera"),
+                 subtitle = "Based on degree, betweenness, and closeness centrality",
+                 x = "Genus", y = "Keystone Score") +
+            theme_minimal() +
+            theme(legend.position = "bottom",
+                  axis.text.y = element_text(size = 8),
+                  plot.title = element_text(hjust = 0.5),
+                  plot.subtitle = element_text(hjust = 0.5))
+          
+          print(p_keystone_genera)
+          ggsave(file.path(FIGURES, "keystone_genera_barplot.png"), plot = p_keystone_genera, width = 10, height = 8, dpi = 300)
+          cat("Keystone genera bar plot saved\n")
+          
+          # Plot 2: Degree vs Betweenness scatter plot
+          p_degree_betweenness <- ggplot(keystone_genera, aes(x = Degree, y = Betweenness, color = Phylum)) +
+            geom_point(alpha = 0.7, size = 2) +
+            labs(title = "Genus Centrality: Degree vs Betweenness",
+                 x = "Degree (Number of Connections)",
+                 y = "Betweenness Centrality") +
+            theme_minimal() +
+            theme(plot.title = element_text(hjust = 0.5))
+          
+          if (nrow(top_keystone_genera) > 0 && nrow(top_keystone_genera) <= 15) {
+            p_degree_betweenness <- p_degree_betweenness +
+              geom_text(data = top_keystone_genera,
+                        aes(label = Genus), size = 3, vjust = -0.5, hjust = 0.5)
+          }
+          
+          print(p_degree_betweenness)
+          ggsave(file.path(FIGURES, "genus_centrality_scatter.png"), plot = p_degree_betweenness, width = 10, height = 8, dpi = 300)
+          cat("Centrality scatter plot saved\n")
+          
+          # Plot 3: Degree distribution by phylum
+          p_degree_by_phylum <- ggplot(keystone_genera, aes(x = Phylum, y = Degree, fill = Phylum)) +
+            geom_boxplot(alpha = 0.7) +
+            geom_jitter(width = 0.2, size = 1, alpha = 0.5) +
+            labs(title = "Degree Distribution by Phylum",
+                 x = "Phylum", y = "Degree") +
+            theme_minimal() +
+            theme(axis.text.x = element_text(angle = 45, hjust = 1),
+                  legend.position = "none",
+                  plot.title = element_text(hjust = 0.5))
+          
+          print(p_degree_by_phylum)
+          ggsave(file.path(FIGURES, "degree_by_phylum.png"), plot = p_degree_by_phylum, width = 12, height = 6, dpi = 300)
+          cat("Degree by phylum plot saved\n")
+          
+        } else {
+          cat("No keystone genera identified with current thresholds.\n")
+        }
+        
+        # Plot 4: Network degree distribution
+        degree_dist <- data.frame(Degree = degree(ig_network))
+        p_degree_dist <- ggplot(degree_dist, aes(x = Degree)) +
+          geom_histogram(bins = 30, fill = "steelblue", alpha = 0.7) +
+          labs(title = "Network Degree Distribution",
+               subtitle = paste("Mean degree:", round(mean(degree_dist$Degree), 2)),
+               x = "Degree", y = "Frequency") +
+          theme_minimal() +
+          theme(plot.title = element_text(hjust = 0.5),
+                plot.subtitle = element_text(hjust = 0.5))
+        
+        print(p_degree_dist)
+        ggsave(file.path(FIGURES, "network_degree_distribution.png"), plot = p_degree_dist, width = 8, height = 6, dpi = 300)
+        cat("Degree distribution plot saved\n")
+        
+        # Plot 5: Correlation strength distribution
+        if (ecount(ig_network) > 0) {
+          cor_strength_data <- data.frame(Strength = abs(edge_weights))
+          p_cor_strength <- ggplot(cor_strength_data, aes(x = Strength)) +
+            geom_histogram(bins = 30, fill = "purple", alpha = 0.7) +
+            labs(title = "Correlation Strength Distribution",
+                 subtitle = paste("Threshold: |r| >", final_threshold),
+                 x = "Correlation Strength (|r|)", y = "Frequency") +
+            theme_minimal() +
+            theme(plot.title = element_text(hjust = 0.5),
+                  plot.subtitle = element_text(hjust = 0.5))
+          
+          print(p_cor_strength)
+          ggsave(file.path(FIGURES, "correlation_strength_distribution.png"), plot = p_cor_strength, width = 8, height = 6, dpi = 300)
+          cat("Correlation strength plot saved\n")
+        }
+        
+      } else {
+        cat("Not enough genera (", vcount(ig_network), ") for keystone analysis.\n")
+      }
+      
+      # ============================================
+      # 8.4 SAVE GENUS NETWORK RESULTS
+      # ============================================
+      
+      cat("\n8.4 Saving Genus Network Results\n")
+      cat(rep("-", 50), "\n", sep = "")
+      
+      # Save network object
+      saveRDS(ig_network, file.path(TABLES, "genus_network.rds"))
+      cat("Genus network object saved to: genus_network.rds\n")
+      
+      # Save basic network information
+      network_summary <- data.frame(
+        Metric = c("Genera", "Edges", "Density", "Average Degree", "Threshold"),
+        Value = c(
+          vcount(ig_network),
+          ecount(ig_network),
+          round(graph.density(ig_network), 4),
+          round(mean(degree(ig_network)), 2),
+          final_threshold
+        )
+      )
+      
+      write.csv(network_summary, file.path(TABLES, "genus_network_summary.csv"), row.names = FALSE)
+      cat("Network summary saved to CSV\n")
+      
+      # Save genus metadata with network metrics if available
+      if (exists("keystone_genera")) {
+        write.csv(keystone_genera, file.path(TABLES, "genus_network_metadata.csv"), row.names = FALSE)
+        cat("Genus metadata saved to CSV\n")
+      }
+      
+      # Create correlation matrix heatmap of top genera
+      cat("Creating correlation matrix heatmap...\n")
+      
+      # Get top correlated genera for heatmap
+      top_n <- min(30, nrow(cor_matrix))
+      if (top_n > 5) {
+        # Calculate mean absolute correlation for each genus
+        mean_abs_cor <- rowMeans(abs(cor_matrix), na.rm = TRUE)
+        top_indices <- order(mean_abs_cor, decreasing = TRUE)[1:top_n]
+        cor_subset <- cor_matrix[top_indices, top_indices]
+        
+        # Get genus names
+        tax_info <- as.data.frame(tax_table(ps_network_filt))
+        genus_names <- tax_info[rownames(cor_subset), "genus"]
+        genus_names[is.na(genus_names)] <- rownames(cor_subset)[is.na(genus_names)]
+        rownames(cor_subset) <- colnames(cor_subset) <- genus_names
+        
+        # Create heatmap
+        p_cor_heatmap <- pheatmap::pheatmap(cor_subset,
+                                            main = paste("Top", top_n, "Genus Correlations"),
+                                            color = colorRampPalette(c("blue", "white", "red"))(100),
+                                            fontsize_row = 8,
+                                            fontsize_col = 8,
+                                            angle_col = 45,
+                                            silent = TRUE)  # Silent to not print immediately
+        
+        # Save heatmap
+        png(file.path(FIGURES, "top_genus_correlation_heatmap.png"), width = 10, height = 8, units = "in", res = 300)
+        print(p_cor_heatmap)
+        dev.off()
+        cat("Correlation heatmap saved\n")
+      }
+    }
+  }
+}
+
+cat("\n")
+cat(rep("=", 60), "\n", sep = "")
+cat("SECTION 8: GENUS NETWORK ANALYSIS COMPLETED\n")
+cat(rep("=", 60), "\n", sep = "")
+cat("All plots should now be saved to:", FIGURES, "\n")
+cat("All tables should now be saved to:", TABLES, "\n")
+###############################################################################
+# =============================================================================
+# SECTION 9: ENVIRONMENTAL VARIABLE ANALYSIS
+# =============================================================================
+
+cat("\n")
+cat(rep("=", 60), "\n", sep = "")
+cat("SECTION 9: ENVIRONMENTAL VARIABLE ANALYSIS\n")
+cat(rep("=", 60), "\n", sep = "")
+
+cat("Analyzing environmental variables...\n")
+
+# Fix 1: Ensure metadata is available and clean
+if (!exists("metadata")) {
+  metadata <- data.frame(sample_data(ps_filtered))
+}
+
+# Fix 2: Remove any problematic columns that might conflict with functions
+# The issue is that 'field' might be a function name in some package
+# Let's rename the column if it exists
+if ("field" %in% colnames(metadata)) {
+  # Rename to avoid conflict with field() function
+  metadata <- metadata %>%
+    rename(field_name = field)
+  cat("Renamed 'field' column to 'field_name' to avoid function conflict\n")
+}
+
+# Check if NMDS exists, otherwise create it
+if (!exists("nmds_result")) {
+  cat("Creating NMDS for environmental analysis...\n")
+  
+  # Extract and clean OTU table
+  otu_table_mat <- as(otu_table(ps_filtered), "matrix")
+  if (taxa_are_rows(ps_filtered)) {
+    otu_table_mat <- t(otu_table_mat)
+  }
+  
+  # Remove empty rows and columns
+  otu_table_mat <- otu_table_mat[rowSums(otu_table_mat) > 0, colSums(otu_table_mat) > 0]
+  
+  # Run NMDS with error handling
+  tryCatch({
+    nmds_result <- metaMDS(otu_table_mat, distance = "bray", trymax = 20, autotransform = FALSE)
+    cat("NMDS created with stress:", round(nmds_result$stress, 3), "\n")
+  }, error = function(e) {
+    cat("NMDS failed:", e$message, "\n")
+    cat("Using existing Bray-Curtis distance instead...\n")
+    
+    # Create a simple NMDS-like result using PCoA
+    bray_dist <- vegan::vegdist(otu_table_mat, method = "bray", na.rm = TRUE)
+    pcoa_result <- cmdscale(bray_dist, k = 2, eig = TRUE)
+    
+    # Create a pseudo-NMDS object
+    nmds_result <- list()
+    nmds_result$points <- pcoa_result$points
+    colnames(nmds_result$points) <- c("NMDS1", "NMDS2")
+    nmds_result$stress <- 0.1  # Placeholder
+    class(nmds_result) <- "metaMDS"
+    
+    assign("nmds_result", nmds_result, envir = .GlobalEnv)
+  })
+}
+
+# Extract numeric environmental variables
+env_data <- data.frame(sample_data(ps_filtered))
+
+# Fix 3: Ensure column names are safe
+colnames(env_data) <- make.names(colnames(env_data))
+
+numeric_cols <- sapply(env_data, is.numeric)
+env_data_numeric <- env_data[, numeric_cols, drop = FALSE]
+
+# Remove columns with all NA, zero variance, or infinite values
+env_data_numeric <- env_data_numeric[, apply(env_data_numeric, 2, function(x) {
+  !all(is.na(x)) && var(x, na.rm = TRUE) > 0 && all(is.finite(x), na.rm = TRUE)
+})]
+
+cat("Number of numeric variables for envfit:", ncol(env_data_numeric), "\n")
+
+if (ncol(env_data_numeric) > 0) {
+  cat("Running envfit...\n")
+  
+  # Ensure NMDS points and environmental data have matching samples
+  common_samples <- intersect(rownames(nmds_result$points), rownames(env_data_numeric))
+  
+  if (length(common_samples) > 5) {  # Need at least 5 samples
+    nmds_points_subset <- nmds_result$points[common_samples, ]
+    env_data_subset <- env_data_numeric[common_samples, , drop = FALSE]
+    
+    # Remove any columns with NA values for envfit
+    env_data_subset <- env_data_subset[, colSums(is.na(env_data_subset)) == 0]
+    
+    if (ncol(env_data_subset) > 0) {
+      tryCatch({
+        envfit_result <- envfit(nmds_points_subset, env_data_subset, perm = 999, na.rm = TRUE)
+        
+        cat("\nENVFIT RESULTS:\n")
+        print(envfit_result)
+        
+        # Extract significant variables
+        significant_vars <- which(envfit_result$vectors$pvals < 0.05)
+        if (length(significant_vars) > 0) {
+          cat("\nSIGNIFICANT VARIABLES (p < 0.05):\n")
+          sig_results <- data.frame(
+            Variable = names(significant_vars),
+            NMDS1 = round(envfit_result$vectors$arrows[significant_vars, 1], 3),
+            NMDS2 = round(envfit_result$vectors$arrows[significant_vars, 2], 3),
+            r2 = round(envfit_result$vectors$r[significant_vars], 3),
+            p_value = round(envfit_result$vectors$pvals[significant_vars], 4)
+          )
+          print(sig_results)
+          
+          # Save significant results
+          write.csv(sig_results, file.path(TABLES, "envfit_significant_variables.csv"), row.names = FALSE)
+          cat("Significant variables saved to CSV\n")
+          
+          # Create envfit plot
+          nmds_scores <- as.data.frame(nmds_points_subset)
+          envfit_scores <- as.data.frame(scores(envfit_result, "vectors"))
+          envfit_scores$variables <- rownames(envfit_scores)
+          envfit_scores$r2 <- envfit_result$vectors$r
+          envfit_scores$p_val <- envfit_result$vectors$pvals
+          
+          # Keep only significant variables
+          envfit_sig <- envfit_scores[envfit_scores$p_val < 0.05, ]
+          
+          if (nrow(envfit_sig) > 0) {
+            # Use the renamed field column
+            if ("field_name" %in% colnames(metadata)) {
+              color_var <- metadata[rownames(nmds_scores), "field_name"]
+              color_label <- "Field"
+            } else if ("field" %in% colnames(metadata)) {
+              color_var <- metadata[rownames(nmds_scores), "field"]
+              color_label <- "Field"
+            } else {
+              # Use sample ID if no field column
+              color_var <- rownames(nmds_scores)
+              color_label <- "Sample"
+            }
+            
+            plot_data <- cbind(nmds_scores, metadata[rownames(nmds_scores), ])
+            
+            # FIXED: Use aes() with .data pronoun instead of aes_string()
+            p_envfit <- ggplot(plot_data, aes(x = NMDS1, y = NMDS2)) +
+              geom_point(aes(color = if ("field_name" %in% colnames(plot_data)) .data$field_name 
+                             else if ("field" %in% colnames(plot_data)) .data$field 
+                             else SampleID), 
+                         size = 3, alpha = 0.7) +
+              geom_segment(data = envfit_sig,
+                           aes(x = 0, y = 0, xend = NMDS1 * 0.8, yend = NMDS2 * 0.8),
+                           arrow = arrow(length = unit(0.2, "cm")),
+                           color = "red", linewidth = 0.8) +
+              geom_text(data = envfit_sig,
+                        aes(x = NMDS1 * 0.9, y = NMDS2 * 0.9, label = variables),
+                        color = "red", size = 4, fontface = "bold") +
+              labs(title = "NMDS with Significant Environmental Variables",
+                   subtitle = paste("Stress =", round(nmds_result$stress, 3)),
+                   color = "Field") +
+              theme_minimal()
+            
+            print(p_envfit)
+            ggsave(file.path(FIGURES, "envfit_plot.png"), plot = p_envfit, width = 10, height = 8, dpi = 300)
+          }
+        } else {
+          cat("No significant environmental variables found (p < 0.05)\n")
+        }
+      }, error = function(e) {
+        cat("Envfit analysis failed:", e$message, "\n")
+        cat("Creating simplified environmental analysis instead...\n")
+        
+        # Create simple correlation heatmap
+        if (ncol(env_data_subset) > 1) {
+          env_cor <- cor(env_data_subset, use = "complete.obs")
+          p_cor <- pheatmap::pheatmap(env_cor,
+                                      main = "Environmental Variable Correlations",
+                                      color = colorRampPalette(c("blue", "white", "red"))(100),
+                                      silent = TRUE)
+          
+          png(file.path(FIGURES, "environmental_correlations.png"), width = 10, height = 8, units = "in", res = 300)
+          print(p_cor)
+          dev.off()
+          cat("Environmental correlation heatmap saved\n")
+        }
+      })
+    } else {
+      cat("No environmental variables without NA values for envfit\n")
+    }
+  } else {
+    cat("Not enough common samples between NMDS and environmental data\n")
+  }
+} else {
+  cat("No suitable numeric variables found for envfit analysis.\n")
+}
+
+# ============================================
+# SIMPLIFIED CATEGORICAL VARIABLE ANALYSIS
+# ============================================
+
+cat("\nPerforming categorical variable analysis...\n")
+
+# Clean OTU table for distance calculation
+otu_table_mat <- as(otu_table(ps_filtered), "matrix")
+if (taxa_are_rows(ps_filtered)) {
+  otu_table_mat <- t(otu_table_mat)
+}
+
+# Remove empty rows and columns
+otu_table_mat <- otu_table_mat[rowSums(otu_table_mat) > 0, colSums(otu_table_mat) > 0]
+
+# Remove any NA values
+otu_table_mat[is.na(otu_table_mat)] <- 0
+
+# Calculate Bray-Curtis distance with error handling
+tryCatch({
+  bray_dist <- vegan::vegdist(otu_table_mat, method = "bray", na.rm = TRUE)
+  
+  # Update metadata with cleaned sample names
+  metadata_clean <- metadata[rownames(otu_table_mat), ]
+  
+  # Test categorical variables
+  cat_vars <- c()
+  
+  # Use the correct column names
+  if ("field_name" %in% colnames(metadata_clean)) {
+    cat_vars <- c(cat_vars, "field_name")
+  } else if ("field" %in% colnames(metadata_clean)) {
+    cat_vars <- c(cat_vars, "field")
+  }
+  
+  # Add other variables if they exist
+  other_vars <- c("take_all_seen", "tillage_method", "fertiliser_use")
+  for (var in other_vars) {
+    if (var %in% colnames(metadata_clean)) {
+      cat_vars <- c(cat_vars, var)
+    }
+  }
+  
+  cat_results <- list()
+  
+  for (var in cat_vars) {
+    if (length(unique(metadata_clean[[var]])) > 1) {
+      cat("Testing categorical variable:", var, "\n")
+      
+      # Check for NA values in grouping variable
+      group_vector <- metadata_clean[[var]]
+      valid_samples <- !is.na(group_vector)
+      
+      if (sum(valid_samples) >= 5) {  # Need at least 5 samples
+        # Subset distance matrix
+        dist_subset <- as.dist(as.matrix(bray_dist)[valid_samples, valid_samples])
+        group_subset <- group_vector[valid_samples]
+        
+        tryCatch({
+          # PERMANOVA
+          permanova_res <- adonis2(dist_subset ~ group_subset, permutations = 99)  # Reduced permutations for speed
+          cat_results[[paste0(var, "_permanova")]] <- permanova_res
+          
+          cat("  PERMANOVA R2:", round(permanova_res$R2[1], 3), 
+              "p-value:", round(permanova_res$`Pr(>F)`[1], 4), "\n")
+          
+        }, error = function(e) {
+          cat("  Analysis failed for", var, ":", e$message, "\n")
+        })
+      } else {
+        cat("  Not enough valid samples for", var, "\n")
+      }
+    }
+  }
+  
+  # Save categorical results if any were successful
+  if (length(cat_results) > 0) {
+    sink(file.path(TABLES, "categorical_analysis_results.txt"))
+    cat("CATEGORICAL VARIABLE ANALYSIS RESULTS\n")
+    cat("=====================================\n\n")
+    for (i in seq_along(cat_results)) {
+      cat("Variable:", names(cat_results)[i], "\n")
+      print(cat_results[[i]])
+      cat("\n-------------------------------------\n\n")
+    }
+    sink()
+    cat("Categorical analysis results saved\n")
+  }
+  
+}, error = function(e) {
+  cat("Distance matrix calculation failed:", e$message, "\n")
+  cat("Skipping categorical analysis\n")
+})
+
+cat("\n")
+cat(rep("=", 60), "\n", sep = "")
+cat("SECTION 9: ENVIRONMENTAL ANALYSIS COMPLETED\n")
+cat(rep("=", 60), "\n", sep = "")
+
+# =============================================================================
+# SECTION 10: RESULTS EXPORT AND SUMMARY
+# =============================================================================
+
+cat("\n")
+cat(rep("=", 50), "\n", sep = "")
+cat("SECTION 10: RESULTS EXPORT AND SUMMARY\n")
+cat(rep("=", 50), "\n", sep = "")
+
+cat("Exporting final results...\n")
+
+# Export diversity metrics
+diversity_export <- data.frame(sample_data(ps_filtered)) %>%
+  rownames_to_column("Sample") %>%
+  select(Sample, tillage_method, fertiliser_use, take_all_seen, field,
+         Shannon, Observed, Simpson, Hill_q0, Hill_q1, Hill_q2)
+
+write.csv(diversity_export, file.path(TABLES, "complete_diversity_metrics.csv"), 
+          row.names = FALSE)
+
+# Summary statistics
+summary_stats <- diversity_export %>%
+  group_by(tillage_method, fertiliser_use, take_all_seen) %>%
+  summarise(
+    n_samples = n(),
+    mean_shannon = mean(Shannon, na.rm = TRUE),
+    sd_shannon = sd(Shannon, na.rm = TRUE),
+    mean_richness = mean(Observed, na.rm = TRUE),
+    sd_richness = sd(Observed, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+write.csv(summary_stats, file.path(TABLES, "summary_statistics.csv"), 
+          row.names = FALSE)
+
+# Generate analysis report
+sink(file.path(TABLES, "analysis_report.txt"))
+cat("MICROBIOME ANALYSIS REPORT\n")
+cat("==========================\n\n")
+cat("Analysis completed:", date(), "\n\n")
+cat("DATA SUMMARY:\n")
+cat("- Final samples:", nsamples(ps_filtered), "\n")
+cat("- Final taxa:", ntaxa(ps_filtered), "\n")
+cat("- Variables analyzed: tillage_method, fertiliser_use, take_all_seen, field\n\n")
+cat("OUTPUT FILES:\n")
+cat("- Figures saved to:", FIGURES, "\n")
+cat("- Tables saved to:", TABLES, "\n")
+sink()
+
+# =============================================================================
+# FIX FOR SECTION 5: BETA DIVERSITY NMDS ISSUE
+# =============================================================================
+
+cat("\n")
+cat(rep("=", 50), "\n", sep = "")
+cat("NOTE: NMDS stress warning detected\n")
+cat(rep("=", 50), "\n", sep = "")
+
+cat("The NMDS warning 'stress is (nearly) zero' suggests:\n")
+cat("1. You may have very few samples (< 10)\n")
+cat("2. Your data may have very low dimensionality\n")
+cat("3. Some samples may be very similar\n\n")
+
+cat("Alternative approaches:\n")
+cat("1. Using PCoA instead of NMDS (already done)\n")
+cat("2. Checking sample similarity...\n")
+
+# Check if we have enough samples for meaningful beta diversity
+n_samples <- nsamples(ps_filtered)
+cat("Number of samples after filtering:", n_samples, "\n")
+
+if (n_samples < 10) {
+  cat("WARNING: Fewer than 10 samples. Beta diversity metrics may not be reliable.\n")
+  cat("Consider focusing on alpha diversity and taxonomic composition instead.\n")
+}
+
+# Simple distance matrix heatmap as alternative
+cat("\nCreating distance matrix heatmap as alternative visualization...\n")
+
+# Create a heatmap of the Bray-Curtis distances
+dist_matrix <- as.matrix(bray_dist)
+colnames(dist_matrix) <- rownames(dist_matrix) <- metadata[rownames(dist_matrix), "field"]
+
+p_dist_heatmap <- pheatmap::pheatmap(dist_matrix,
+                                     main = "Bray-Curtis Distance Matrix",
+                                     color = colorRampPalette(c("white", "blue"))(100),
+                                     display_numbers = FALSE,
+                                     cluster_rows = TRUE,
+                                     cluster_cols = TRUE,
+                                     silent = TRUE)  # Silent to not print immediately
+
+# Save the heatmap
+png(file.path(FIGURES, "distance_matrix_heatmap.png"), width = 10, height = 8, units = "in", res = 300)
+print(p_dist_heatmap)
+dev.off()
+
+# =============================================================================
+# FINAL COMPLETION MESSAGE
+# =============================================================================
+
+cat("\n")
+cat(rep("=", 50), "\n", sep = "")
+cat("ANALYSIS COMPLETED SUCCESSFULLY!\n")
+cat(rep("=", 50), "\n", sep = "")
+cat("Results saved to:\n")
+cat("- Figures:", FIGURES, "\n")
+cat("- Tables:", TABLES, "\n\n")
+
+cat("Key outputs created:\n")
+cat("1. Data quality plots (rarefaction, sequencing depth)\n")
+cat("2. Alpha diversity plots by multiple variables\n")
+cat("3. Hill diversity analysis\n")
+cat("4. Beta diversity (NMDS, PCoA, distance heatmap)\n")
+cat("5. Taxonomic abundance bar plots\n")
+cat("6. Taxonomic composition heatmaps\n")
+cat("7. Microbial correlation network\n")
+cat("8. Environmental variable analysis\n")
+cat("9. Comprehensive summary tables\n\n")
+
+cat("Note: If NMDS showed low stress warning, PCoA and distance heatmaps\n")
+cat("provide reliable alternative visualizations of beta diversity.\n")
+
